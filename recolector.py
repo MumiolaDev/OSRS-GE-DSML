@@ -9,8 +9,10 @@ from base_de_datos import OSRSBaseDatos
 # Configurar logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s |--| %(levelname)s |--| %(message)s')
 
-# Lista de ítems a monitorear (puedes ampliarla)
-ITEM_IDS = [377, 440, 563, 564, 561]
+# Lista de ítems a monitorear. Vacía = sin filtro, se recolectan TODOS los
+# ítems que devuelve la API (uso normal). Para pruebas rápidas o acotadas,
+# poner acá una lista de item_ids, ej: [377, 440, 563, 564, 561]
+ITEM_IDS = []
 api = OSRSGeAPI()
 
 def collect(table, func, interval_name ,db, timestamp = None):
@@ -24,13 +26,14 @@ def collect(table, func, interval_name ,db, timestamp = None):
             logging.warning(f"No se obtuvieron datos para {interval_name}")
             return
 
-        # La API solo entrega el snapshot completo (todos los ítems del juego);
-        # acá nos quedamos solo con los ítems que nos interesa monitorear.
-        df = df[df['item_id'].isin(ITEM_IDS)]
+        # La API entrega el snapshot completo (todos los ítems del juego).
+        # Si ITEM_IDS no está vacío, filtramos a solo esos ítems.
+        if ITEM_IDS:
+            df = df[df['item_id'].isin(ITEM_IDS)]
 
-        if df.empty:
-            logging.warning(f"Ninguno de los ITEM_IDS monitoreados tenía datos para {interval_name}")
-            return
+            if df.empty:
+                logging.warning(f"Ninguno de los ITEM_IDS monitoreados tenía datos para {interval_name}")
+                return
 
         OSRSBaseDatos.insertar_precios(db, table, df)
 
@@ -48,10 +51,16 @@ def collect_1h(db, timestamp=None):
     return collect('precios_1h', api.get_historical_1h, '1h',db, timestamp=timestamp)
 
 if __name__ == "__main__":
-    
-    
-    db = OSRSBaseDatos('data//testesito.db')
+
+    db = OSRSBaseDatos('data/osrs_ge.db')
     logging.info("Iniciando recolector...")
+
+    # Catálogo de ítems (id -> nombre, members, buy_limit). Se actualiza cada
+    # vez que arranca el recolector; los datos cambian muy rara vez.
+    mapping = api.get_item_mapping()
+    n_items = db.guardar_items(mapping)
+    logging.info(f"Catálogo de ítems actualizado: {n_items} ítems")
+
     # Ejecutar inmediatamente al arrancar
     data_5m = collect_5min(db)
     data_1h = collect_1h(db)

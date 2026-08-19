@@ -13,15 +13,20 @@ class OSRSBaseDatos:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
 
+        # WAL permite leer (notebook / futura app) mientras el recolector escribe.
+        c.execute('PRAGMA journal_mode=WAL')
 
         # Crea las tablas si no existen.
-        # Tabla items
+        # Tabla items: catálogo de ítems (id -> nombre, members, límite de compra)
         c.execute('''CREATE TABLE IF NOT EXISTS items
                     (item_id INTEGER PRIMARY KEY,
                     name TEXT,
                     members INTEGER,
                     buy_limit INTEGER)''')
         # Tabla precios_5m
+        # PRIMARY KEY compuesta (item_id, timestamp): evita duplicados si un
+        # ciclo de recolección se solapa con el anterior, y sirve de índice
+        # para las consultas por ítem.
         c.execute(
             '''CREATE TABLE IF NOT EXISTS precios_5m (
                 item_id INT,
@@ -29,8 +34,13 @@ class OSRSBaseDatos:
                 avg_high_price INTEGER,
                 avg_low_price INTEGER,
                 high_volume INTEGER,
-                low_volume INTEGER
+                low_volume INTEGER,
+                PRIMARY KEY (item_id, timestamp)
                 )'''
+                )
+        c.execute(
+            '''CREATE INDEX IF NOT EXISTS idx_precios_5m_timestamp
+                ON precios_5m (timestamp)'''
                 )
         # Tabla precios_1h
         c.execute(
@@ -40,10 +50,15 @@ class OSRSBaseDatos:
                 avg_high_price INTEGER,
                 avg_low_price INTEGER,
                 high_volume INTEGER,
-                low_volume INTEGER
+                low_volume INTEGER,
+                PRIMARY KEY (item_id, timestamp)
                 )'''
                 )
-        
+        c.execute(
+            '''CREATE INDEX IF NOT EXISTS idx_precios_1h_timestamp
+                ON precios_1h (timestamp)'''
+                )
+
         # Tabla predicciones
         c.execute('''CREATE TABLE IF NOT EXISTS predicciones
                     (
@@ -87,18 +102,51 @@ class OSRSBaseDatos:
                 )
 
             c.execute(
-                f'''INSERT INTO {table} (
+                f'''INSERT OR IGNORE INTO {table} (
                 item_id,
                 timestamp,
                 avg_high_price,
                 avg_low_price,
                 high_volume,
                 low_volume
-                ) 
+                )
                 VALUES (?,?,?,?,?,?)''', filas)
-            
+
         conn.commit()
         conn.close()
+
+    def guardar_items(self, items_mapping):
+        """
+        Guarda/actualiza el catálogo de ítems.
+        items_mapping: lista de dicts tal como los entrega
+        OSRSGeAPI.get_item_mapping() (claves: id, name, members, limit).
+        """
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+
+        filas = [
+            (
+                item['id'],
+                item.get('name'),
+                int(bool(item.get('members'))),
+                item.get('limit'),
+            )
+            for item in items_mapping
+        ]
+
+        c.executemany(
+            '''INSERT INTO items (item_id, name, members, buy_limit)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(item_id) DO UPDATE SET
+                    name=excluded.name,
+                    members=excluded.members,
+                    buy_limit=excluded.buy_limit''',
+            filas,
+        )
+
+        conn.commit()
+        conn.close()
+        return len(filas)
 
     def obtener_precios_id(self, item_id, table):
         """
