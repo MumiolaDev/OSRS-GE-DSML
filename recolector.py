@@ -15,17 +15,23 @@ api = OSRSGeAPI()
 
 def collect(table, func, interval_name ,db, timestamp = None):
     """Función genérica para recolectar datos."""
- 
+
     try:
         print(f"Recolectando datos {interval_name}")
         df = func(timestamp=timestamp)  # obtener prices ( id, intervalo)
- 
-       
+
         if df.empty:
             logging.warning(f"No se obtuvieron datos para {interval_name}")
             return
-     
-       
+
+        # La API solo entrega el snapshot completo (todos los ítems del juego);
+        # acá nos quedamos solo con los ítems que nos interesa monitorear.
+        df = df[df['item_id'].isin(ITEM_IDS)]
+
+        if df.empty:
+            logging.warning(f"Ninguno de los ITEM_IDS monitoreados tenía datos para {interval_name}")
+            return
+
         OSRSBaseDatos.insertar_precios(db, table, df)
 
         logging.info(f"Insertados {len(df)} registros en {table}")

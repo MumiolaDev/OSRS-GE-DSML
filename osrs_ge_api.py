@@ -76,15 +76,15 @@ class OSRSGeAPI:
 
         url = f"{self.base_url}/timeseries"
         url += f"?timestep={timestep}"
-        url += f"&id={id}"
+        url += f"&id={item_id}"
 
         response = requests.get(
             url,
             headers=self.headers
         )
-        response.raise_for_status()  
+        response.raise_for_status()
 
-        df = self._procesar_series_id(response.json(), id)
+        df = self._procesar_series_id(response.json(), item_id)
         return df
 
 ## Procesadores

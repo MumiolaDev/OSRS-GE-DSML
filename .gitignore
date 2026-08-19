@@ -1,0 +1,27 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Bases de datos locales (se regeneran con recolector.py)
+*.db
+*.sqlite
+*.sqlite3
+
+# Modelos entrenados
+models/
+*.pkl
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
