@@ -20,6 +20,7 @@ como avg_high_price - avg_low_price, no al revés.
 import math
 import sqlite3
 import statistics
+import time
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +133,16 @@ def calcular_resumen_item(db, item_id, nombre, buy_limit, tabla='precios_1h', ho
     """Calcula el set completo de métricas para un ítem, usando hasta
     `horas_historial` horas más recientes de su historial (default 720h =
     30 días) para percentil/volatilidad/tendencia."""
-    df = db.obtener_precios_id(item_id, tabla)
+    # Filtra por fecha en la query SQL (desde_timestamp) en vez de traer todo
+    # el historial del ítem y recortar después con .tail() en pandas — con
+    # meses de datos acumulados, traer todo en cada refresh del screener se
+    # vuelve cada vez más lento.
+    desde = int(time.time()) - horas_historial * 3600
+    df = db.obtener_precios_id(item_id, tabla, desde_timestamp=desde)
     if df.empty:
         return None
 
-    df = df.sort_values('timestamp').tail(horas_historial)
+    df = df.sort_values('timestamp')
     if len(df) < 2:
         return None
 
