@@ -17,6 +17,10 @@ env/
 models/
 *.pkl
 
+# Logs del recolector corriendo 24/7
+logs/
+*.log
+
 # Jupyter
 .ipynb_checkpoints/
 
