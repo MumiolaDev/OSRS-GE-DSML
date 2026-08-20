@@ -56,6 +56,21 @@ class OSRSGeAPI:
         df = self._procesar_data_historicals(response.json())
         return df
     
+    def get_historical_6h(self, timestamp=None):
+        """
+        Obtiene datos históricos de seis horas.
+        Si no se especifica timestamp, obtiene los más recientes.
+        """
+        url = f"{self.base_url}/6h"
+        if timestamp:
+            url += f"?timestamp={timestamp}"
+
+        response = requests.get(url, headers=self.headers)
+        response.raise_for_status()
+
+        df = self._procesar_data_historicals(response.json())
+        return df
+
     def get_item_mapping(self):
         """Obtiene el mapeo de ID a nombre de item"""
         response = requests.get(
