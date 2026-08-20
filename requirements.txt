@@ -7,3 +7,4 @@ scikit-learn==1.8.0
 joblib==1.5.3
 seaborn==0.13.2
 matplotlib==3.10.8
+streamlit==1.62.0
