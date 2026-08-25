@@ -4,30 +4,28 @@ import pandas as pd
 import numpy as np
 
 
-def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6]):
+def construir_features(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6]):
     """
-    Genera features para un ítem a partir de su serie temporal.
-    df debe tener columnas: timestamp, avg_high_price, avg_low_price, high_volume, low_volume
+    Calcula, sobre `df` (columnas: timestamp, avg_high_price, avg_low_price,
+    high_volume, low_volume), los lags/medias móviles/encoding cíclico en
+    espacio logarítmico — sin generar el target ni descartar filas por
+    historia insuficiente. Es el cálculo que comparten:
+    - `preprocess_item` (entrenamiento: le agrega el target y descarta la
+      última fila, que no tiene "período siguiente" contra el cual entrenar)
+    - `prediccion.py` (inferencia hacia adelante: necesita justo la última
+      fila, la que `preprocess_item` descartaría, porque ahí no hay todavía
+      un precio real siguiente con el cual comparar).
+    Mantener esto en un solo lugar evita que el cálculo de features en
+    entrenamiento y en inferencia se desincronice con el tiempo (train/serve
+    skew).
 
-    Los lags y medias móviles se calculan en espacio logarítmico (log-precio,
-    log-volumen) y el target es el log-retorno del siguiente período
-    (log(precio_t+1) - log(precio_t)), no el precio crudo. Esto es lo que
-    hace comparables las features/target entre ítems de escalas de precio
-    muy distintas (ver build_training_set) — un modelo por ítem no lo
-    necesitaría, pero uno global sí.
-
-    Devuelve un DataFrame con las features, más 'timestamp_target',
-    'price_actual' y 'price_target' (para reconstruir precio en gp después
-    de predecir en espacio de retorno) y la columna 'target'.
+    Devuelve el DataFrame ordenado por timestamp con las columnas de
+    features agregadas al final, sin dropna ni selección de columnas.
     """
     df = df.sort_values('timestamp').copy()
-    if len(df) < max(lags, max(ma_windows)) + 2:
-        return pd.DataFrame()  # no hay suficientes datos
 
     # Precios inválidos (<=0) no tienen logaritmo definido.
     df = df[df[target_col] > 0].reset_index(drop=True)
-    if len(df) < max(lags, max(ma_windows)) + 2:
-        return pd.DataFrame()
 
     # Variables de tiempo: hora del día y día de la semana, encoding cíclico.
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
@@ -44,7 +42,7 @@ def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6]):
     df['log_volume'] = np.log1p(df['total_volume'])
     # log(high/low): spread relativo, comparable entre ítems (a diferencia
     # de high - low en gp). NaN si avg_high_price es inválido, se limpia
-    # con el dropna() de más abajo.
+    # con el dropna() del llamador.
     high_valido = df['avg_high_price'].where(df['avg_high_price'] > 0)
     df['log_spread'] = np.log(high_valido) - df['log_price']
 
@@ -58,6 +56,53 @@ def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6]):
     for w in ma_windows:
         df[f'ma_price_{w}'] = df['log_price'].rolling(w).mean()
         df[f'ma_volume_{w}'] = df['log_volume'].rolling(w).mean()
+
+    return df
+
+
+# Columnas crudas/intermedias que nunca son features del modelo (se calculan
+# para llegar a las features, pero no se le pasan al modelo tal cual).
+_COLUMNAS_NO_FEATURE = [
+    'timestamp', 'datetime', 'hour', 'dow',
+    'avg_high_price', 'avg_low_price', 'high_volume', 'low_volume', 'total_volume',
+    'log_price', 'log_volume', 'log_spread',
+]
+
+
+def columnas_feature(df, target_col='avg_low_price'):
+    """Nombres de columnas de `df` que son features del modelo (excluye
+    crudas/intermedias y `target_col`, que puede no estar en la lista fija
+    de arriba si es distinta de avg_low_price)."""
+    excluir = set(_COLUMNAS_NO_FEATURE) | {target_col}
+    return [col for col in df.columns if col not in excluir]
+
+
+def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6]):
+    """
+    Genera el set de entrenamiento para un ítem a partir de su serie
+    temporal (features de `construir_features` + target).
+
+    El target es el log-retorno del siguiente período
+    (log(precio_t+1) - log(precio_t)), no el precio crudo. Esto es lo que
+    hace comparables las features/target entre ítems de escalas de precio
+    muy distintas (ver build_training_set) — un modelo por ítem no lo
+    necesitaría, pero uno global sí.
+
+    Devuelve un DataFrame con las features, más 'timestamp_target',
+    'price_actual' y 'price_target' (para reconstruir precio en gp después
+    de predecir en espacio de retorno) y la columna 'target'.
+    """
+    if len(df) < max(lags, max(ma_windows)) + 2:
+        return pd.DataFrame()  # no hay suficientes datos
+
+    df = construir_features(df, target_col, lags, ma_windows)
+    if len(df) < max(lags, max(ma_windows)) + 2:
+        return pd.DataFrame()
+
+    # Nombres de las columnas de features, calculados ANTES de agregar las
+    # de reconstrucción de abajo (si no, columnas_feature() las incluiría
+    # también a esas y quedarían duplicadas en el `df[...]` final).
+    feature_cols = columnas_feature(df, target_col)
 
     # Columnas de reconstrucción: precio actual (conocido en el momento de
     # predecir) y precio/timestamp del período siguiente (lo que se quiere
@@ -73,15 +118,6 @@ def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6]):
     # período siguiente para el target)
     df = df.dropna().reset_index(drop=True)
 
-    # Seleccionar columnas de features + columnas de reconstrucción + target
-    # (excluye las crudas y los intermedios usados solo para calcularlas)
-    exclude = [
-        'timestamp', 'datetime', 'hour', 'dow', target_col,
-        'avg_high_price', 'high_volume', 'low_volume', 'total_volume',
-        'log_price', 'log_volume', 'log_spread',
-        'price_actual', 'price_target', 'timestamp_target', 'target',
-    ]
-    feature_cols = [col for col in df.columns if col not in exclude]
     return df[feature_cols + ['timestamp_target', 'price_actual', 'price_target', 'target']]
 
 
