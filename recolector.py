@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import schedule
 import time
 import logging
@@ -74,6 +75,8 @@ INTERVALS = {
     '6h': (collect_6h, 6 * 60 * 60),
 }
 
+TABLA_POR_INTERVALO = {'5m': 'precios_5m', '1h': 'precios_1h', '6h': 'precios_6h'}
+
 
 def job_diario(db):
     """
@@ -144,6 +147,117 @@ def backfill(interval, start_ts, end_ts, db, delay=1.0):
     return n_calls, total_filas
 
 
+def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=None):
+    """
+    Como `backfill()`, pero solo pide a la API los timestamps que la tabla
+    todavía no tiene — pensado para rellenar huecos de recolección
+    intermitente sin volver a pedir lo que ya está guardado (INSERT OR
+    IGNORE ya lo protegía de duplicar, pero re-pedir miles de timestamps
+    existentes desperdicia llamadas a una API pública sin necesidad).
+
+    on_progreso: callback opcional, se llama cada ~24 requests (útil para
+    ej. disparar un reentrenamiento periódico mientras se rellenan huecos
+    largos, sin acoplar esta función a entrenador.py).
+    """
+    collect_func, step = INTERVALS[interval]
+    tabla = TABLA_POR_INTERVALO[interval]
+
+    conn = sqlite3.connect(db.db_path)
+    c = conn.cursor()
+    c.execute(f'SELECT DISTINCT timestamp FROM {tabla} WHERE timestamp BETWEEN ? AND ?', (start_ts, end_ts))
+    existentes = {row[0] for row in c.fetchall()}
+    conn.close()
+
+    faltantes = [ts for ts in range(start_ts, end_ts + 1, step) if ts not in existentes]
+    logging.info(f"Backfill de faltantes {interval}: {len(faltantes)} timestamps a descargar")
+
+    n_calls = 0
+    total_filas = 0
+    for ts in faltantes:
+        df = collect_func(db, timestamp=ts)
+        n_calls += 1
+        total_filas += len(df) if df is not None else 0
+
+        if n_calls % 24 == 0:
+            logging.info(
+                f"Backfill de faltantes {interval}: {n_calls}/{len(faltantes)} llamadas, "
+                f"{total_filas} filas acumuladas"
+            )
+            if on_progreso:
+                on_progreso()
+
+        time.sleep(delay)
+
+    logging.info(f"Backfill de faltantes {interval} completo: {n_calls} llamadas, {total_filas} filas totales")
+    return n_calls, total_filas
+
+
+def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, retrain_cada_segundos=600):
+    """
+    Se corre una vez al arrancar el recolector: por cada intervalo en
+    `intervalos`, mira desde cuándo hay datos en su tabla y rellena con
+    `backfill_faltantes` todo lo que falte hasta ahora. Soluciona la
+    intermitencia sola — antes había que acordarse de correr
+    backfill_historico.py a mano después de cada corte.
+
+    Si el hueco es grande (el recolector estuvo apagado varios días), va
+    reentrenando el modelo cada `retrain_cada_segundos` mientras rellena,
+    en vez de esperar al final — mismo mecanismo que usaba
+    backfill_historico.py. Con huecos chicos (el caso normal de reiniciar
+    el proceso) esto no llega a dispararse y el arranque es rápido.
+
+    Si una tabla todavía no tiene ningún dato (item/intervalo nuevo, ej. la
+    primera vez que se activó 6h) no hay huecos que rellenar — la
+    recolección normal ya se encarga de sembrarla.
+
+    El límite superior del rango se recorta un `step` hacia atrás (por
+    intervalo) para no pedirle a la API el bucket todavía en curso: ese
+    snapshot no está cerrado ni agregado del lado de la wiki todavía, así
+    que siempre vuelve vacío (dispara "No se obtuvieron datos" sin que sea
+    un error real). Ese último tramo se termina rellenando solo con la
+    próxima recolección programada (5m/1h/6h), una vez cerrado.
+    """
+    ahora = int(time.time())
+    ultimo_retrain = time.time()
+
+    def tick():
+        nonlocal ultimo_retrain
+        if time.time() - ultimo_retrain >= retrain_cada_segundos:
+            logging.info("Relleno de huecos en curso: reentrenando con lo descargado hasta ahora...")
+            try:
+                job_diario(db)
+            except Exception as e:
+                logging.error(f"Error en reentrenamiento intermedio durante el relleno de huecos: {e}")
+            ultimo_retrain = time.time()
+
+    for interval in intervalos:
+        tabla = TABLA_POR_INTERVALO[interval]
+        conn = sqlite3.connect(db.db_path)
+        c = conn.cursor()
+        c.execute(f'SELECT MIN(timestamp) FROM {tabla}')
+        inicio = c.fetchone()[0]
+        conn.close()
+
+        if inicio is None:
+            logging.info(f"{tabla}: sin datos todavía, nada que rellenar.")
+            continue
+
+        _, step = INTERVALS[interval]
+        limite = ahora - step
+
+        if limite < inicio:
+            logging.info(f"{tabla}: sin huecos cerrados que rellenar todavía.")
+            continue
+
+        inicio_legible = datetime.fromtimestamp(inicio).strftime('%Y-%m-%d %H:%M:%S')
+        limite_legible = datetime.fromtimestamp(limite).strftime('%Y-%m-%d %H:%M:%S')
+        logging.info(f"=== Relleno de huecos al iniciar: {interval} desde {inicio_legible} hasta {limite_legible} ===")
+        try:
+            backfill_faltantes(interval, inicio, limite, db, delay=delay, on_progreso=tick)
+        except Exception as e:
+            logging.error(f"Error rellenando huecos de {interval}: {e}")
+
+
 if __name__ == "__main__":
     db = OSRSBaseDatos('data/osrs_ge.db')
     logging.info("Iniciando recolector...")
@@ -158,6 +272,10 @@ if __name__ == "__main__":
     data_5m = collect_5min(db)
     data_1h = collect_1h(db)
     data_6h = collect_6h(db)
+
+    # Rellenar huecos dejados por cortes anteriores antes de entrar al loop
+    # — así el recolector se pone al día solo en cada arranque.
+    rellenar_huecos_al_inicio(db)
 
     # Programar tareas
     schedule.every(5).minutes.do(collect_5min, db)
