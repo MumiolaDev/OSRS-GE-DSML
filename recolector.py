@@ -77,11 +77,14 @@ INTERVALS = {
 
 def job_diario(db):
     """
-    Refresca el screener y reentrena el modelo. Pensado para correr una vez
-    al día (horario de baja actividad). Si el refresh del resumen falla, se
-    salta el reentrenamiento: obtener_top_items_liquidez() depende de que
-    resumen_actual esté fresca, así que reentrenar con una tabla vieja/vacía
-    no tiene sentido.
+    Refresca el screener y reentrena el modelo. Se llama "diario" por lo que
+    hace (mismo rol que un job de reentrenamiento diario en producción), pero
+    durante la fase de pruebas se programa cada hora (ver `__main__` más
+    abajo) para iterar más rápido mientras se acumula historial — al pasar a
+    producción, volver a una cadencia diaria. Si el refresh del resumen
+    falla, se salta el reentrenamiento: obtener_top_items_liquidez() depende
+    de que resumen_actual esté fresca, así que reentrenar con una tabla
+    vieja/vacía no tiene sentido.
     """
     try:
         logging.info("Job diario: refrescando resumen_actual...")
@@ -154,14 +157,18 @@ if __name__ == "__main__":
     # Ejecutar inmediatamente al arrancar
     data_5m = collect_5min(db)
     data_1h = collect_1h(db)
+    data_6h = collect_6h(db)
+
     # Programar tareas
     schedule.every(5).minutes.do(collect_5min, db)
     schedule.every(1).hour.do(collect_1h, db)
-    schedule.every().day.at("03:00").do(job_diario, db)
+    schedule.every(6).hours.do(collect_6h, db)
+    # Fase de pruebas: job_diario cada hora (no una vez al día) para iterar
+    # más rápido — volver a schedule.every().day.at("03:00") en producción.
+    schedule.every(1).hour.do(job_diario, db)
     schedule.every().sunday.at("04:00").do(job_semanal, db)
     while True:
-        
+
         schedule.run_pending()
         time.sleep(1)
 
-        
