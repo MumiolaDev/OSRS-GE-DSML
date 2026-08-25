@@ -73,7 +73,23 @@ def entrenar_modelo_global(db, n_items=N_ITEMS_LIQUIDOS):
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     model_path = os.path.join(MODEL_DIR, f"model_{MODEL_VERSION}.pkl")
-    joblib.dump(model, model_path)
+    # Se guarda un bundle (no solo el modelo): XGBoost, con enable_categorical,
+    # codifica item_id/members como los códigos enteros de su dtype 'category'
+    # en el momento del fit — si prediccion.py arma esas columnas con una
+    # categoría distinta (ej. un solo ítem, código 0) en vez de con exactamente
+    # las mismas categorías vistas al entrenar, los splits categóricos del
+    # árbol comparan contra el ítem equivocado sin ningún error visible.
+    # Guardar `dataset['item_id'].cat.categories` (y lo mismo para members)
+    # es lo que le permite a prediccion.py reproducir esa codificación exacta.
+    joblib.dump({
+        'model': model,
+        'feature_cols': feature_cols,
+        'item_id_categories': dataset['item_id'].cat.categories,
+        'members_categories': dataset['members'].cat.categories,
+        'target_col': 'avg_low_price',
+        'lags': 5,
+        'ma_windows': [3, 6],
+    }, model_path)
     logging.info(f"Modelo guardado en {model_path}")
 
     train_ts = int(dataset['timestamp_target'].max())
