@@ -121,18 +121,29 @@ def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6]):
     return df[feature_cols + ['timestamp_target', 'price_actual', 'price_target', 'target']]
 
 
-def build_training_set(db, item_ids, tabla='precios_1h', **kwargs):
+def build_training_set(db, item_ids, tabla='precios_1h', hasta_timestamp=None, **kwargs):
     """
     Arma el dataset de entrenamiento del modelo global: recorre `item_ids`,
     genera features por ítem con preprocess_item, les agrega el item_id y
     las features estáticas del ítem (buy_limit, members desde la tabla
     `items`), y concatena todo en un solo DataFrame ordenado por tiempo.
 
+    hasta_timestamp (opcional): acota cada ítem a datos con
+    timestamp <= hasta_timestamp — es lo que hace posible entrenar "como si
+    fuera" un momento del pasado (replay_historico.py), en vez de siempre
+    usar todo lo que ya esté cargado en la tabla.
+
     kwargs se pasan a preprocess_item (target_col, lags, ma_windows).
     """
+    # Una sola query para todos los ítems (obtener_precios_multi) en vez de
+    # una conexión+query por ítem — con ~200 ítems, abrir 200 conexiones
+    # SQLite por separado era el cuello de botella real de esta función,
+    # sobre todo repetido en cada checkpoint del replay histórico
+    # (replay_historico.py).
+    precios_todos = db.obtener_precios_multi(item_ids, tabla, hasta_timestamp=hasta_timestamp)
+
     frames = []
-    for item_id in item_ids:
-        df = db.obtener_precios_id(item_id, tabla)
+    for item_id, df in precios_todos.groupby('item_id'):
         feat = preprocess_item(df, **kwargs)
         if feat.empty:
             continue

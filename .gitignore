@@ -10,6 +10,9 @@ env/
 
 # Bases de datos locales (se regeneran con recolector.py)
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
 
