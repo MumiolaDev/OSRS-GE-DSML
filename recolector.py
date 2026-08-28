@@ -109,9 +109,17 @@ def _entrenar_desde_config(db, cfg, guardar_en_disco=True, calcular_metricas_hor
     precio_minimo/excluir_item_ids, que solo el clasificador soporta hoy
     (ver entrenar_modelo_global/entrenar_clasificador_direccional).
 
-    Actualiza modelos_config.ultimo_entrenamiento_ts al terminar — no se
-    hace dentro de un try/except acá porque el llamador (job_horario/
-    job_diario) ya envuelve cada llamada a esta función en el suyo propio.
+    Actualiza modelos_config.ultimo_entrenamiento_ts SOLO si el
+    entrenamiento efectivamente corrió (no en un corte temprano por falta
+    de ítems/historial suficiente, ver el valor de retorno de
+    entrenar_modelo_global/entrenar_clasificador_direccional) — así la app
+    de escritorio no muestra "entrenado hace un momento" sobre un modelo
+    que en realidad nunca llegó a entrenar. No se hace dentro de un
+    try/except acá porque el llamador (job_horario/job_diario) ya envuelve
+    cada llamada a esta función en el suyo propio.
+
+    Devuelve True/False según si entrenó de verdad — lo usa
+    escritorio/paginas/pagina_modelos.py para el botón "Entrenar ahora".
     """
     kwargs = dict(model_name=cfg['model_id'], guardar_en_disco=guardar_en_disco)
     if cfg['modo_seleccion'] == 'manual':
@@ -126,12 +134,15 @@ def _entrenar_desde_config(db, cfg, guardar_en_disco=True, calcular_metricas_hor
             kwargs['excluir_item_ids'] = cfg['excluir_item_ids']
         if cfg['umbral_pct'] is not None:
             kwargs['umbral_pct'] = cfg['umbral_pct']
-        entrenar_clasificador_direccional(db, **kwargs)
+        _, test = entrenar_clasificador_direccional(db, **kwargs)
+        exito = test is not None
     else:
         kwargs['calcular_metricas_horizonte'] = calcular_metricas_horizonte
-        entrenar_modelo_global(db, **kwargs)
+        exito = bool(entrenar_modelo_global(db, **kwargs))
 
-    db.actualizar_modelo_config(cfg['model_id'], ultimo_entrenamiento_ts=int(time.time()))
+    if exito:
+        db.actualizar_modelo_config(cfg['model_id'], ultimo_entrenamiento_ts=int(time.time()))
+    return exito
 
 
 def job_horario(db):

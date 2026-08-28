@@ -122,6 +122,14 @@ def entrenar_modelo_global(
     muestra acotada del test set — caro (multiplica el costo de inferencia
     por N_PASOS_HORIZONTE), por eso solo se activa desde job_diario (una vez
     al día), nunca en job_horario ni en el replay.
+
+    Devuelve True si se entrenó y se guardaron métricas/predicciones, False
+    si se cortó antes por falta de ítems/datos suficientes (sin excepción,
+    ver los logging.error de cada caso) — lo usa
+    recolector._entrenar_desde_config para no marcar
+    modelos_config.ultimo_entrenamiento_ts en una corrida que en realidad
+    no entrenó nada (ej. un modelo recién creado sobre un ítem sin
+    suficiente historial todavía).
     """
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
 
@@ -138,12 +146,12 @@ def entrenar_modelo_global(
             f"[{model_name}] Sin ítems disponibles — correr metricas.py antes de entrenar en "
             "modo en vivo (o esperar más historial acumulado en modo replay)."
         )
-        return
+        return False
 
     dataset = build_training_set(db, item_ids, hasta_timestamp=ahora_ts)
     if dataset.empty:
         logging.error(f"[{model_name}] No se pudo construir el dataset de entrenamiento (sin datos suficientes).")
-        return
+        return False
     logging.info(f"[{model_name}] Dataset combinado: {len(dataset)} filas, {dataset['item_id'].nunique()} ítems con features")
 
     if modo_evaluacion == 'walkforward':
@@ -152,7 +160,7 @@ def entrenar_modelo_global(
         test = dataset[dataset['timestamp_target'] == corte].copy()
         if train.empty or test.empty:
             logging.error(f"[{model_name}] Dataset insuficiente para walk-forward (train={len(train)}, test={len(test)}).")
-            return
+            return False
     else:
         corte = dataset['timestamp_target'].quantile(1 - TEST_FRACTION)
         train = dataset[dataset['timestamp_target'] <= corte]
@@ -249,6 +257,8 @@ def entrenar_modelo_global(
 
     if calcular_metricas_horizonte:
         _evaluar_y_guardar_horizontes(db, bundle, test, model_name, train_ts, modo_evaluacion)
+
+    return True
 
 
 def _evaluar_y_guardar_horizontes(db, bundle, test, model_name, train_ts, modo_evaluacion):
