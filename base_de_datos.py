@@ -254,8 +254,272 @@ class OSRSBaseDatos:
                     tarea TEXT PRIMARY KEY,
                     ultima_corrida INTEGER)''')
 
+        # modelos_config: registro de modelos definidos por el usuario (app de
+        # escritorio) — reemplaza los 3 modelos que hasta ahora vivían
+        # hardcodeados en recolector.job_horario/job_diario. model_id es
+        # literalmente el mismo string que entrenador.py usa como
+        # model_name/model_version en model_metrics/predicciones/el nombre del
+        # .pkl — no es un id aparte, así que un modelo de acá se referencia
+        # igual en todo el resto del pipeline sin ninguna tabla puente.
+        #
+        # modo_seleccion distingue cómo se arma el universo de ítems:
+        # 'manual' (item_ids: JSON con la lista elegida a mano por el usuario
+        # en el selector de la app — el caso nuevo que motiva esta tabla) o
+        # 'liquidez' (n_items/solo_f2p/precio_minimo/excluir_item_ids: los
+        # mismos parámetros que ya acepta obtener_top_items_liquidez[_hasta]
+        # — el modo en el que se siembran los 3 modelos productivos
+        # preexistentes, sin cambiarles el comportamiento).
+        #
+        # cadencia ('horaria'|'diaria'|'manual') decide en qué job del
+        # recolector se reentrena solo (o nunca, en 'manual' — para que
+        # explorar configuraciones nuevas no cargue el scheduler). estado
+        # ('activo'|'pausado') permite desactivar un modelo sin borrar su
+        # historial en model_metrics/predicciones ni su .pkl.
+        c.execute('''CREATE TABLE IF NOT EXISTS modelos_config (
+                    model_id TEXT PRIMARY KEY,
+                    nombre TEXT,
+                    tipo TEXT,
+                    modo_seleccion TEXT,
+                    item_ids TEXT,
+                    n_items INTEGER,
+                    solo_f2p INTEGER,
+                    precio_minimo INTEGER,
+                    excluir_item_ids TEXT,
+                    lags INTEGER DEFAULT 5,
+                    ma_windows TEXT DEFAULT '[3, 6]',
+                    horizonte_horas INTEGER DEFAULT 1,
+                    umbral_pct REAL,
+                    cadencia TEXT,
+                    estado TEXT DEFAULT 'activo',
+                    creado_en INTEGER,
+                    ultimo_entrenamiento_ts INTEGER)''')
+
         conn.commit()
 
+        self._sembrar_modelos_productivos(conn)
+
+    def _sembrar_modelos_productivos(self, conn):
+        """
+        Siembra en modelos_config los 3 modelos que hasta ahora vivían
+        hardcodeados en recolector.job_horario/job_diario (global_horario,
+        global_diario, f2p10_100gp_clasif) — así job_horario/job_diario
+        pueden pasar a iterar modelos_config sin perder ni cambiar el
+        comportamiento de los modelos productivos existentes al actualizar
+        una DB que ya tenía datos. INSERT OR IGNORE sobre la PK (model_id):
+        no pisa cambios que el usuario haya hecho después (ej. pausar uno)
+        si esto corre de nuevo en cada arranque.
+
+        Los parámetros de selección de ítems (n_items/solo_f2p/
+        precio_minimo/excluir_item_ids) son exactamente los que ya usaba
+        recolector.job_horario antes de esta tabla — ver su código en la
+        rama previa a app-escritorio-v1, o entrenador.py.
+        """
+        import json
+
+        c = conn.cursor()
+        ahora = int(time.time())
+        filas = [
+            (
+                'global_horario', 'Global horario (200 ítems líquidos)', 'regresor', 'liquidez',
+                None, 200, 0, None, None, 5, '[3, 6]', 1, None, 'horaria', 'activo', ahora, None,
+            ),
+            (
+                'global_diario', 'Global diario (200 ítems líquidos)', 'regresor', 'liquidez',
+                None, 200, 0, None, None, 5, '[3, 6]', 1, None, 'diaria', 'activo', ahora, None,
+            ),
+            (
+                'f2p10_100gp_clasif', 'Clasificador F2P (10 ítems, ≥100gp)', 'clasificador', 'liquidez',
+                None, 10, 1, 100, json.dumps([2353]), 5, '[3, 6]', 1, 0.5, 'horaria', 'activo', ahora, None,
+            ),
+        ]
+        c.executemany(
+            '''INSERT OR IGNORE INTO modelos_config (
+                model_id, nombre, tipo, modo_seleccion, item_ids, n_items, solo_f2p,
+                precio_minimo, excluir_item_ids, lags, ma_windows, horizonte_horas,
+                umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            filas,
+        )
+        conn.commit()
+
+    @staticmethod
+    def _fila_a_modelo_config(fila):
+        """Convierte una fila cruda de modelos_config (tupla, orden de
+        columnas de la tabla) en un dict con item_ids/excluir_item_ids/
+        ma_windows ya deserializados de JSON — así el resto del código
+        (recolector.py, la UI) no repite json.loads en cada lugar que lee
+        un modelo."""
+        import json
+
+        (
+            model_id, nombre, tipo, modo_seleccion, item_ids, n_items, solo_f2p,
+            precio_minimo, excluir_item_ids, lags, ma_windows, horizonte_horas,
+            umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts,
+        ) = fila
+        return {
+            'model_id': model_id,
+            'nombre': nombre,
+            'tipo': tipo,
+            'modo_seleccion': modo_seleccion,
+            'item_ids': json.loads(item_ids) if item_ids else None,
+            'n_items': n_items,
+            'solo_f2p': bool(solo_f2p),
+            'precio_minimo': precio_minimo,
+            'excluir_item_ids': json.loads(excluir_item_ids) if excluir_item_ids else None,
+            'lags': lags,
+            'ma_windows': json.loads(ma_windows) if ma_windows else [3, 6],
+            'horizonte_horas': horizonte_horas,
+            'umbral_pct': umbral_pct,
+            'cadencia': cadencia,
+            'estado': estado,
+            'creado_en': creado_en,
+            'ultimo_entrenamiento_ts': ultimo_entrenamiento_ts,
+        }
+
+    def crear_modelo_config(
+        self, model_id, nombre, tipo, cadencia, modo_seleccion='manual',
+        item_ids=None, n_items=None, solo_f2p=False, precio_minimo=None,
+        excluir_item_ids=None, lags=5, ma_windows=None, horizonte_horas=1,
+        umbral_pct=None,
+    ):
+        """
+        Da de alta un modelo definido por el usuario. model_id es elegido
+        por el llamador (ver escritorio/paginas/pagina_modelos.py: se arma
+        a partir del nombre) porque es el mismo string que después se usa
+        como model_name/model_version en todo entrenador.py/prediccion.py —
+        no hay un id autoincremental separado. Lanza sqlite3.IntegrityError
+        si el model_id ya existe (el llamador debe elegir uno libre antes
+        de llamar, ver obtener_modelo_config).
+
+        modo_seleccion='manual' (el caso nuevo, ítems elegidos a mano en la
+        UI): item_ids es la lista completa, n_items/solo_f2p/precio_minimo/
+        excluir_item_ids quedan en None/False, no se usan.
+        modo_seleccion='liquidez' (mismo comportamiento que los modelos
+        productivos preexistentes): item_ids queda en None, se arma en
+        entrenamiento vía obtener_top_items_liquidez[_hasta] con estos
+        parámetros.
+        """
+        import json
+
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        ahora = int(time.time())
+        c.execute(
+            '''INSERT INTO modelos_config (
+                model_id, nombre, tipo, modo_seleccion, item_ids, n_items, solo_f2p,
+                precio_minimo, excluir_item_ids, lags, ma_windows, horizonte_horas,
+                umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'activo',?,NULL)''',
+            (
+                model_id, nombre, tipo, modo_seleccion,
+                json.dumps(item_ids) if item_ids is not None else None,
+                n_items, int(bool(solo_f2p)), precio_minimo,
+                json.dumps(excluir_item_ids) if excluir_item_ids else None,
+                lags, json.dumps(ma_windows or [3, 6]), horizonte_horas, umbral_pct,
+                cadencia, ahora,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return model_id
+
+    def listar_modelos_config(self, cadencia=None, estado=None):
+        """Lista modelos_config como dicts (ver _fila_a_modelo_config),
+        opcionalmente filtrados por cadencia y/o estado — usado por
+        recolector.job_horario/job_diario (cadencia='horaria'/'diaria',
+        estado='activo') para saber qué reentrenar en cada corrida, y por
+        la UI para mostrar el listado completo (sin filtro)."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        query = 'SELECT * FROM modelos_config'
+        condiciones, params = [], []
+        if cadencia is not None:
+            condiciones.append('cadencia = ?')
+            params.append(cadencia)
+        if estado is not None:
+            condiciones.append('estado = ?')
+            params.append(estado)
+        if condiciones:
+            query += ' WHERE ' + ' AND '.join(condiciones)
+        query += ' ORDER BY creado_en'
+        c.execute(query, params)
+        filas = c.fetchall()
+        conn.close()
+        return [self._fila_a_modelo_config(f) for f in filas]
+
+    def obtener_modelo_config(self, model_id):
+        """Un modelo de modelos_config como dict, o None si no existe."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('SELECT * FROM modelos_config WHERE model_id = ?', (model_id,))
+        fila = c.fetchone()
+        conn.close()
+        return self._fila_a_modelo_config(fila) if fila else None
+
+    def contar_modelos_config_activos(self):
+        """Cantidad de modelos en estado='activo' (cadencia horaria o
+        diaria) — usado para aplicar el tope de modelos simultáneos antes
+        de activar uno nuevo (ver escritorio/paginas/pagina_modelos.py),
+        sin contar los de cadencia='manual' (no cargan el scheduler)."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(
+            "SELECT COUNT(*) FROM modelos_config WHERE estado = 'activo' AND cadencia != 'manual'"
+        )
+        n = c.fetchone()[0]
+        conn.close()
+        return n
+
+    def actualizar_modelo_config(self, model_id, **campos):
+        """
+        Actualiza columnas arbitrarias de un modelo existente (ej.
+        estado='pausado', o ultimo_entrenamiento_ts=... después de
+        reentrenar). `campos` son nombres de columna de modelos_config tal
+        cual — item_ids/excluir_item_ids/ma_windows se serializan a JSON
+        automáticamente si vienen como list. No valida que el model_id
+        exista: un UPDATE sobre un id inexistente simplemente no toca
+        ninguna fila (rowcount 0).
+        """
+        import json
+
+        if not campos:
+            return 0
+        columnas_json = {'item_ids', 'excluir_item_ids', 'ma_windows'}
+        valores = []
+        sets = []
+        for columna, valor in campos.items():
+            if columna in columnas_json and isinstance(valor, list):
+                valor = json.dumps(valor)
+            sets.append(f'{columna} = ?')
+            valores.append(valor)
+        valores.append(model_id)
+
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(f'UPDATE modelos_config SET {", ".join(sets)} WHERE model_id = ?', valores)
+        filas_afectadas = c.rowcount
+        conn.commit()
+        conn.close()
+        return filas_afectadas
+
+    def eliminar_modelo_config(self, model_id):
+        """
+        Borra un modelo de modelos_config. Deliberadamente NO borra su
+        historial en model_metrics/predicciones ni su .pkl en models/ — se
+        conserva como registro histórico (mismo criterio que
+        mantenimiento.podar_metricas_por_item, que también conserva el
+        agregado); si el llamador quiere limpiar eso también, es una acción
+        aparte y explícita del lado de la UI (escritorio/paginas/
+        pagina_modelos.py), no un efecto secundario silencioso de borrar la
+        configuración.
+        """
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('DELETE FROM modelos_config WHERE model_id = ?', (model_id,))
+        filas_afectadas = c.rowcount
+        conn.commit()
+        conn.close()
+        return filas_afectadas
 
     def insertar_precios(self, table, data):
 
