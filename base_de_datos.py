@@ -4,6 +4,22 @@ import time
 
 DB_PATH = "data/osrs_ge.db"
 
+# Topes técnicos para modelos_config, aplicados en crear_modelo_config —
+# no son solo una sugerencia de la UI, viven acá para que cualquier
+# llamador (la app de escritorio, o un script futuro) quede protegido por
+# igual. MAX_ITEMS_POR_MODELO: build_training_set + el fit de XGBoost sobre
+# más ítems empieza a tardar minutos en una PC hogareña (el modelo global
+# productivo ya usa 200, pero corre una sola vez por cadencia — con varios
+# modelos de usuario del mismo tamaño conviviendo, job_horario/job_diario
+# se alargarían demasiado). MAX_MODELOS_ACTIVOS: cada modelo con cadencia
+# horaria/diaria se reentrena en serie dentro del mismo job (ver
+# recolector.job_horario/job_diario) — más modelos activos simultáneos
+# alarga esos jobs proporcionalmente. Ninguno de los dos es un límite
+# validado contra hardware real, son puntos de partida conservadores;
+# ajustar si en la práctica resultan muy restrictivos u optimistas.
+MAX_ITEMS_POR_MODELO = 50
+MAX_MODELOS_ACTIVOS = 8
+
 class OSRSBaseDatos:
 
     def __init__(self, db_path = DB_PATH ):
@@ -398,8 +414,25 @@ class OSRSBaseDatos:
         productivos preexistentes): item_ids queda en None, se arma en
         entrenamiento vía obtener_top_items_liquidez[_hasta] con estos
         parámetros.
+
+        Lanza ValueError si modo_seleccion='manual' pide más de
+        MAX_ITEMS_POR_MODELO ítems, o si cadencia != 'manual' y ya hay
+        MAX_MODELOS_ACTIVOS modelos activos con cadencia horaria/diaria
+        (ver esas constantes arriba) — el modelo NO se crea en ese caso.
+        Un modelo con cadencia='manual' no cuenta contra ese tope (nunca
+        se reentrena solo, no carga el scheduler).
         """
         import json
+
+        if modo_seleccion == 'manual' and item_ids and len(item_ids) > MAX_ITEMS_POR_MODELO:
+            raise ValueError(
+                f"Máximo {MAX_ITEMS_POR_MODELO} ítems por modelo (se pidieron {len(item_ids)})."
+            )
+        if cadencia != 'manual' and self.contar_modelos_config_activos() >= MAX_MODELOS_ACTIVOS:
+            raise ValueError(
+                f"Ya hay {MAX_MODELOS_ACTIVOS} modelos activos con cadencia horaria/diaria — "
+                "pausá o eliminá alguno antes de activar uno nuevo (o creá este con cadencia 'manual')."
+            )
 
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
@@ -479,11 +512,25 @@ class OSRSBaseDatos:
         automáticamente si vienen como list. No valida que el model_id
         exista: un UPDATE sobre un id inexistente simplemente no toca
         ninguna fila (rowcount 0).
+
+        Si `campos` reactiva un modelo (estado='activo') aplica el mismo
+        tope de MAX_MODELOS_ACTIVOS que crear_modelo_config — sin este
+        chequeo, pausar y reactivar modelos sería una forma de eludir el
+        tope. No se valida al pausar ni al tocar otros campos.
         """
         import json
 
         if not campos:
             return 0
+        if campos.get('estado') == 'activo':
+            modelo_actual = self.obtener_modelo_config(model_id)
+            cadencia = campos.get('cadencia', modelo_actual['cadencia'] if modelo_actual else 'manual')
+            ya_activo = modelo_actual is not None and modelo_actual['estado'] == 'activo'
+            if cadencia != 'manual' and not ya_activo and self.contar_modelos_config_activos() >= MAX_MODELOS_ACTIVOS:
+                raise ValueError(
+                    f"Ya hay {MAX_MODELOS_ACTIVOS} modelos activos con cadencia horaria/diaria — "
+                    "pausá o eliminá alguno antes de reactivar este."
+                )
         columnas_json = {'item_ids', 'excluir_item_ids', 'ma_windows'}
         valores = []
         sets = []
