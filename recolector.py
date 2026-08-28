@@ -7,8 +7,11 @@ from datetime import datetime
 from osrs_ge_api import OSRSGeAPI
 from base_de_datos import OSRSBaseDatos
 from metricas import calcular_resumen_todos
-from entrenador import entrenar_modelo_global
-from mantenimiento import archivar_datos_antiguos
+from entrenador import (
+    entrenar_modelo_global, MODEL_NAME_HORARIO, MODEL_NAME_DIARIO,
+    entrenar_clasificador_direccional, MODEL_NAME_CLASIF_F2P_100GP,
+)
+from mantenimiento import ejecutar_mantenimiento_semanal
 
 
 # Configurar logging: a archivo además de consola. Necesario para poder
@@ -69,6 +72,21 @@ def collect_6h(db, timestamp=None):
     return collect('precios_6h', api.get_historical_6h, '6h', db, timestamp=timestamp)
 
 
+def _programar_cada_n_minutos_alineado(minutos, func, db):
+    """
+    Registra `func` para correr en cada múltiplo de `minutos` dentro de la
+    hora (:00, :05, ..., :55 si minutos=5), alineado al reloj de pared — a
+    diferencia de `schedule.every(N).minutes`, que es relativo al momento en
+    que arrancó el proceso (si el recolector arranca a las 10:03, dispararía
+    a las 10:08, 10:13...). La librería `schedule` no tiene una primitiva
+    nativa de "cada N minutos alineado al reloj"; se logra registrando un
+    job por cada minuto múltiplo de N vía `every().hour.at(':MM')`, que sí
+    es una hora de reloj absoluta.
+    """
+    for m in range(0, 60, minutos):
+        schedule.every().hour.at(f":{m:02d}", "UTC").do(func, db)
+
+
 INTERVALS = {
     '5m': (collect_5min, 5 * 60),
     '1h': (collect_1h, 60 * 60),
@@ -78,19 +96,26 @@ INTERVALS = {
 TABLA_POR_INTERVALO = {'5m': 'precios_5m', '1h': 'precios_1h', '6h': 'precios_6h'}
 
 
-def job_diario(db):
+def job_horario(db):
     """
-    Refresca el screener y reentrena el modelo. Se llama "diario" por lo que
-    hace (mismo rol que un job de reentrenamiento diario en producción), pero
-    durante la fase de pruebas se programa cada hora (ver `__main__` más
-    abajo) para iterar más rápido mientras se acumula historial — al pasar a
-    producción, volver a una cadencia diaria. Si el refresh del resumen
-    falla, se salta el reentrenamiento: obtener_top_items_liquidez() depende
-    de que resumen_actual esté fresca, así que reentrenar con una tabla
-    vieja/vacía no tiene sentido.
+    Corre cada hora (:05, unos minutos después de collect_1h para no competir
+    por I/O/CPU con la recolección): refresca resumen_actual y reentrena
+    'global_horario' — la cadencia rápida, pensada para alertas casi en
+    tiempo real. Si el refresh del resumen falla, se salta el
+    reentrenamiento: obtener_top_items_liquidez() depende de que
+    resumen_actual esté fresca, así que reentrenar con una tabla vieja/vacía
+    no tiene sentido. También reentrena 'f2p10_100gp_clasif'
+    (entrenador.entrenar_clasificador_direccional), la variante productiva
+    del clasificador direccional — 10 ítems F2P más líquidos con
+    precio_minimo=100 y Steel bar excluido (item_id 2353), la configuración
+    que en el backtest walk-forward de 90 días convirtió una estrategia
+    perdedora (comprar a ciegas: -67.6M gp) en ganadora (+7.3M gp); la
+    variante sin filtro de precio no le ganaba a comprar a ciegas — en su
+    propio try/except independiente, para que un fallo ahí no afecte al
+    reentrenamiento de global_horario ni a las alertas.
     """
     try:
-        logging.info("Job diario: refrescando resumen_actual...")
+        logging.info("Job horario: refrescando resumen_actual...")
         resumen = calcular_resumen_todos(db)
         n = db.guardar_resumen(resumen)
         logging.info(f"resumen_actual actualizado: {n} ítems")
@@ -99,20 +124,73 @@ def job_diario(db):
         return
 
     try:
-        logging.info("Job diario: reentrenando modelo...")
-        entrenar_modelo_global(db)
+        logging.info("Job horario: reentrenando modelo global_horario...")
+        entrenar_modelo_global(db, model_name=MODEL_NAME_HORARIO)
     except Exception as e:
-        logging.error(f"Error reentrenando el modelo: {e}")
+        logging.error(f"Error reentrenando global_horario: {e}")
+
+    try:
+        logging.info(f"Job horario: reentrenando {MODEL_NAME_CLASIF_F2P_100GP}...")
+        entrenar_clasificador_direccional(
+            db, n_items=10, solo_f2p=True, precio_minimo=100, excluir_item_ids=[2353],  # Steel bar
+            model_name=MODEL_NAME_CLASIF_F2P_100GP, guardar_en_disco=True,
+        )
+    except Exception as e:
+        logging.error(f"Error reentrenando {MODEL_NAME_CLASIF_F2P_100GP}: {e}")
+
+    try:
+        from alertas import evaluar_alertas
+        evaluar_alertas(db)
+    except Exception as e:
+        logging.error(f"Error evaluando alertas: {e}")
+
+
+def job_diario(db):
+    """
+    Corre una vez al día a las 03:00: reentrena 'global_diario' — la
+    cadencia estable, referencia de calidad de largo plazo — y calcula
+    métricas de horizonte (2..6 pasos, evaluacion.py), que son caras y por
+    eso no se calculan en cada corrida horaria. Reusa resumen_actual, ya
+    refrescada por job_horario en la misma hora — no la recalcula de nuevo.
+    """
+    try:
+        logging.info("Job diario: reentrenando modelo global_diario...")
+        entrenar_modelo_global(db, model_name=MODEL_NAME_DIARIO, calcular_metricas_horizonte=True)
+    except Exception as e:
+        logging.error(f"Error reentrenando global_diario: {e}")
 
 
 def job_semanal(db):
-    """Archiva a resolución diaria y purga los datos horarios fuera de la
-    ventana de retención (ver mantenimiento.py)."""
+    """
+    Archiva/purga/podda todas las tablas con retención y libera espacio
+    liberado con incremental_vacuum (ver mantenimiento.ejecutar_mantenimiento_semanal).
+    Registra la corrida en mantenimiento_estado — es lo que le permite a
+    verificar_catchup_semanal() detectar si esto no corrió en su ventana
+    programada (domingo 04:00 UTC) porque el proceso estuvo apagado justo
+    entonces, y disparar un catch-up al arrancar en vez de esperar hasta el
+    domingo siguiente.
+    """
     try:
-        logging.info("Job semanal: archivando datos antiguos...")
-        archivar_datos_antiguos(db)
+        logging.info("Job semanal: mantenimiento (retención, purga, vacuum)...")
+        ejecutar_mantenimiento_semanal(db)
+        db.registrar_corrida('job_semanal', int(time.time()))
     except Exception as e:
-        logging.error(f"Error archivando datos antiguos: {e}")
+        logging.error(f"Error en el mantenimiento semanal: {e}")
+
+
+def verificar_catchup_semanal(db, umbral_dias=8):
+    """
+    Si job_semanal no corrió en los últimos `umbral_dias` (más que una
+    semana, con margen), lo corre ahora mismo en vez de esperar al próximo
+    domingo 04:00 UTC — cubre el caso de que el proceso haya estado
+    apagado justo en esa ventana. Se llama al arrancar, junto con
+    rellenar_huecos_al_inicio().
+    """
+    ultima = db.obtener_ultima_corrida('job_semanal')
+    ahora = int(time.time())
+    if ultima is None or ahora - ultima > umbral_dias * 86400:
+        logging.info("job_semanal: ventana perdida (o primera corrida) — haciendo catch-up ahora...")
+        job_semanal(db)
 
 
 def backfill(interval, start_ts, end_ts, db, delay=1.0):
@@ -147,7 +225,7 @@ def backfill(interval, start_ts, end_ts, db, delay=1.0):
     return n_calls, total_filas
 
 
-def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=None):
+def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0):
     """
     Como `backfill()`, pero solo pide a la API los timestamps que la tabla
     todavía no tiene — pensado para rellenar huecos de recolección
@@ -155,9 +233,11 @@ def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=No
     IGNORE ya lo protegía de duplicar, pero re-pedir miles de timestamps
     existentes desperdicia llamadas a una API pública sin necesidad).
 
-    on_progreso: callback opcional, se llama cada ~24 requests (útil para
-    ej. disparar un reentrenamiento periódico mientras se rellenan huecos
-    largos, sin acoplar esta función a entrenador.py).
+    Devuelve (n_calls, total_filas, faltantes) — `faltantes` es la lista de
+    timestamps que efectivamente hacía falta pedir, para que el llamador
+    (rellenar_huecos_al_inicio) pueda agruparla en rangos contiguos y
+    disparar el replay histórico (replay_historico.py) solo sobre los
+    tramos que realmente tenían un hueco.
     """
     collect_func, step = INTERVALS[interval]
     tabla = TABLA_POR_INTERVALO[interval]
@@ -183,16 +263,38 @@ def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=No
                 f"Backfill de faltantes {interval}: {n_calls}/{len(faltantes)} llamadas, "
                 f"{total_filas} filas acumuladas"
             )
-            if on_progreso:
-                on_progreso()
 
         time.sleep(delay)
 
     logging.info(f"Backfill de faltantes {interval} completo: {n_calls} llamadas, {total_filas} filas totales")
-    return n_calls, total_filas
+    return n_calls, total_filas, faltantes
 
 
-def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, retrain_cada_segundos=600):
+def _agrupar_en_rangos(timestamps, step):
+    """
+    Agrupa una lista de timestamps (no necesariamente ordenada) en rangos
+    contiguos (inicio, fin) según `step` — ej. [100, 105, 110, 200, 205] con
+    step=5 da [(100, 110), (200, 205)]. Usado para acotar el replay
+    histórico (replay_historico.ejecutar_replay) exactamente a los tramos
+    que tenían un hueco real, sin re-simular checkpoints en tramos donde ya
+    había cobertura en vivo.
+    """
+    if not timestamps:
+        return []
+    ts_ordenados = sorted(timestamps)
+    rangos = []
+    inicio = fin = ts_ordenados[0]
+    for ts in ts_ordenados[1:]:
+        if ts == fin + step:
+            fin = ts
+        else:
+            rangos.append((inicio, fin))
+            inicio = fin = ts
+    rangos.append((inicio, fin))
+    return rangos
+
+
+def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0):
     """
     Se corre una vez al arrancar el recolector: por cada intervalo en
     `intervalos`, mira desde cuándo hay datos en su tabla y rellena con
@@ -200,11 +302,15 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, retr
     intermitencia sola — antes había que acordarse de correr
     backfill_historico.py a mano después de cada corte.
 
-    Si el hueco es grande (el recolector estuvo apagado varios días), va
-    reentrenando el modelo cada `retrain_cada_segundos` mientras rellena,
-    en vez de esperar al final — mismo mecanismo que usaba
-    backfill_historico.py. Con huecos chicos (el caso normal de reiniciar
-    el proceso) esto no llega a dispararse y el arranque es rápido.
+    Solo `precios_1h` alimenta el modelo/screener (build_training_set,
+    calcular_resumen_todos), así que solo para ese intervalo, después de
+    rellenar los datos crudos, se agrupan los huecos detectados en rangos
+    contiguos (_agrupar_en_rangos) y se dispara replay_historico.ejecutar_replay
+    por cada uno — reentrena en los momentos exactos en que job_horario/
+    job_diario habrían corrido durante ese hueco, en vez de esperar a un
+    solo reentrenamiento final con todo el historial (ver
+    replay_historico.py para el porqué). Para 5m/6h no hace falta: no
+    alimentan ningún entrenamiento.
 
     Si una tabla todavía no tiene ningún dato (item/intervalo nuevo, ej. la
     primera vez que se activó 6h) no hay huecos que rellenar — la
@@ -216,22 +322,34 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, retr
     que siempre vuelve vacío (dispara "No se obtuvieron datos" sin que sea
     un error real). Ese último tramo se termina rellenando solo con la
     próxima recolección programada (5m/1h/6h), una vez cerrado.
-    """
-    ahora = int(time.time())
-    ultimo_retrain = time.time()
 
-    def tick():
-        nonlocal ultimo_retrain
-        if time.time() - ultimo_retrain >= retrain_cada_segundos:
-            logging.info("Relleno de huecos en curso: reentrenando con lo descargado hasta ahora...")
-            try:
-                job_diario(db)
-            except Exception as e:
-                logging.error(f"Error en reentrenamiento intermedio durante el relleno de huecos: {e}")
-            ultimo_retrain = time.time()
+    El límite inferior del rango se acota a `mantenimiento.RETENCION_DIAS`
+    de cada tabla, no a `MIN(timestamp)` — sin esto, un hueco viejo (ej. la
+    tabla tiene algún dato suelto de hace más de un año) hace que esto
+    intente rellenar/replayear meses de historia que `mantenimiento.py` va
+    a purgar en la próxima corrida semanal de todos modos. No vale la pena
+    gastar horas de replay walk-forward (ver replay_historico.py) sobre
+    datos que no se van a conservar.
+
+    `ahora = int(time.time())` no cae en un múltiplo exacto del `step` del
+    intervalo, y la API devuelve 400 Bad Request si se le pide un timestamp
+    no alineado (ver el gotcha documentado en CLAUDE.md/osrs_ge_api.py) —
+    por eso `limite_retencion` y `limite` se calculan a partir de `ahora`
+    ya alineado hacia abajo al `step` de cada intervalo, no de `ahora`
+    crudo. `RETENCION_DIAS[tabla] * 86400` y `step` son ambos múltiplos del
+    `step`, así que alinear una sola vez alcanza para que toda la
+    aritmética de más abajo quede alineada también.
+    """
+    from mantenimiento import RETENCION_DIAS
+    from replay_historico import ejecutar_replay
+
+    ahora = int(time.time())
 
     for interval in intervalos:
         tabla = TABLA_POR_INTERVALO[interval]
+        _, step = INTERVALS[interval]
+        ahora_alineado = ahora - (ahora % step)
+
         conn = sqlite3.connect(db.db_path)
         c = conn.cursor()
         c.execute(f'SELECT MIN(timestamp) FROM {tabla}')
@@ -242,8 +360,15 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, retr
             logging.info(f"{tabla}: sin datos todavía, nada que rellenar.")
             continue
 
-        _, step = INTERVALS[interval]
-        limite = ahora - step
+        limite_retencion = ahora_alineado - RETENCION_DIAS[tabla] * 86400
+        if inicio < limite_retencion:
+            logging.info(
+                f"{tabla}: MIN(timestamp) es más viejo que la retención "
+                f"({RETENCION_DIAS[tabla]}d) — no se rellena esa parte, se va a purgar sola."
+            )
+            inicio = limite_retencion
+
+        limite = ahora_alineado - step
 
         if limite < inicio:
             logging.info(f"{tabla}: sin huecos cerrados que rellenar todavía.")
@@ -253,9 +378,21 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, retr
         limite_legible = datetime.fromtimestamp(limite).strftime('%Y-%m-%d %H:%M:%S')
         logging.info(f"=== Relleno de huecos al iniciar: {interval} desde {inicio_legible} hasta {limite_legible} ===")
         try:
-            backfill_faltantes(interval, inicio, limite, db, delay=delay, on_progreso=tick)
+            _, _, faltantes = backfill_faltantes(interval, inicio, limite, db, delay=delay)
         except Exception as e:
             logging.error(f"Error rellenando huecos de {interval}: {e}")
+            continue
+
+        if interval != '1h' or not faltantes:
+            continue
+
+        rangos = _agrupar_en_rangos(faltantes, step)
+        logging.info(f"Replay histórico: {len(rangos)} rango(s) de hueco detectado(s) en precios_1h")
+        for inicio_rango, fin_rango in rangos:
+            try:
+                ejecutar_replay(db, inicio_rango, fin_rango)
+            except Exception as e:
+                logging.error(f"Error en replay histórico del rango {inicio_rango}-{fin_rango}: {e}")
 
 
 if __name__ == "__main__":
@@ -274,17 +411,33 @@ if __name__ == "__main__":
     data_6h = collect_6h(db)
 
     # Rellenar huecos dejados por cortes anteriores antes de entrar al loop
-    # — así el recolector se pone al día solo en cada arranque.
+    # — así el recolector se pone al día solo en cada arranque. Incluye el
+    # replay histórico si había huecos en precios_1h (ver
+    # rellenar_huecos_al_inicio/replay_historico.py).
     rellenar_huecos_al_inicio(db)
 
-    # Programar tareas
-    schedule.every(5).minutes.do(collect_5min, db)
-    schedule.every(1).hour.do(collect_1h, db)
-    schedule.every(6).hours.do(collect_6h, db)
-    # Fase de pruebas: job_diario cada hora (no una vez al día) para iterar
-    # más rápido — volver a schedule.every().day.at("03:00") en producción.
-    schedule.every(1).hour.do(job_diario, db)
-    schedule.every().sunday.at("04:00").do(job_semanal, db)
+    # Si job_semanal no corrió en su ventana programada (proceso apagado
+    # justo el domingo 04:00 UTC), hacer catch-up ahora en vez de esperar
+    # hasta el domingo siguiente.
+    verificar_catchup_semanal(db)
+
+    # Catch-up en vivo: refresca resumen_actual y el modelo productivo ahora
+    # mismo, en vez de esperar al próximo :05 programado — importante sobre
+    # todo después de un replay largo, para no dejar el dashboard/las
+    # alertas con datos desactualizados hasta la próxima hora en punto.
+    job_horario(db)
+
+    # Programar tareas, alineadas al reloj de pared (:00/:05/:10... en vez de
+    # relativas a cuándo arrancó este proceso) — ver _programar_cada_n_minutos_alineado.
+    _programar_cada_n_minutos_alineado(5, collect_5min, db)
+    schedule.every().hour.at(":00", "UTC").do(collect_1h, db)
+    for h in (0, 6, 12, 18):
+        schedule.every().day.at(f"{h:02d}:00", "UTC").do(collect_6h, db)
+    # job_horario a :05, cinco minutos después de collect_1h, para no competir
+    # por I/O/CPU con la recolección que acaba de correr en el mismo minuto.
+    schedule.every().hour.at(":05", "UTC").do(job_horario, db)
+    schedule.every().day.at("03:00", "UTC").do(job_diario, db)
+    schedule.every().sunday.at("04:00", "UTC").do(job_semanal, db)
     while True:
 
         schedule.run_pending()

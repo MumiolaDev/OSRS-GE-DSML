@@ -18,7 +18,7 @@ defecto de sqlite3 lo absorbe.
 import logging
 
 from base_de_datos import OSRSBaseDatos
-from recolector import rellenar_huecos_al_inicio, job_diario
+from recolector import rellenar_huecos_al_inicio, job_horario, job_diario
 
 DB_PATH = 'data/osrs_ge.db'
 
@@ -28,7 +28,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s |--| %(levelname)s |
 def main():
     db = OSRSBaseDatos(DB_PATH)
     rellenar_huecos_al_inicio(db)
-    logging.info("Relleno de huecos completo. Reentrenamiento final con todo el historial...")
+    logging.info("Relleno de huecos completo. Reentrenamiento final con todo el historial (horario + diario)...")
+    job_horario(db)
     job_diario(db)
     logging.info("Listo.")
 
