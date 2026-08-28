@@ -136,32 +136,40 @@ class PaginaOportunidades(QWidget):
         """
         Refresco manual, no automático — con datos horarios no se justifica
         un auto-refresh en vivo (mismo criterio que ya usaba dashboard.py).
+        Envuelto en try/except: una falla acá (ej. la DB bloqueada un
+        instante por el recolector, o un modelo con un .pkl corrupto) no
+        debe dejar la pestaña rota, solo avisar y mantener lo que ya
+        estaba mostrando.
         """
-        # resumen_actual no tiene buy_limit (vive en items, no es parte del
-        # screener calculado) -- mismo JOIN que ya usa alertas.py para
-        # anotarlo. Sin este JOIN, la columna "Límite de compra" desaparece
-        # en silencio (crear_tabla descarta columnas curadas que no están
-        # en el DataFrame en vez de fallar) en vez de mostrar un error.
-        conn = sqlite3.connect(self.db.db_path)
-        resumen = pd.read_sql_query(
-            "SELECT r.*, i.buy_limit FROM resumen_actual r JOIN items i ON i.item_id = r.item_id", conn,
-        )
-        conn.close()
-
-        if resumen.empty:
-            self.label_contador.setText(
-                "resumen_actual está vacía todavía — esperar a que el recolector corra su primer job horario."
+        try:
+            # resumen_actual no tiene buy_limit (vive en items, no es parte
+            # del screener calculado) -- mismo JOIN que ya usa alertas.py
+            # para anotarlo. Sin este JOIN, la columna "Límite de compra"
+            # desaparece en silencio (crear_tabla descarta columnas
+            # curadas que no están en el DataFrame en vez de fallar) en
+            # vez de mostrar un error.
+            conn = sqlite3.connect(self.db.db_path)
+            resumen = pd.read_sql_query(
+                "SELECT r.*, i.buy_limit FROM resumen_actual r JOIN items i ON i.item_id = r.item_id", conn,
             )
-            self.modelo_tabla.set_dataframe(resumen)
-            return
+            conn.close()
 
-        filtrado = filtrar_screener_liquido(resumen, volumen_24h_minimo=self.spin_volumen.value())
-        clave_orden = self.combo_orden.currentData() or 'margen_neto'
-        filtrado = filtrado.sort_values(clave_orden, ascending=False).reset_index(drop=True)
+            if resumen.empty:
+                self.label_contador.setText(
+                    "resumen_actual está vacía todavía — esperar a que el recolector corra su primer job horario."
+                )
+                self.modelo_tabla.set_dataframe(resumen)
+                return
 
-        señales = _calcular_senales(self.db, filtrado['item_id'].tolist())
-        filtrado = filtrado.copy()
-        filtrado['señal'] = filtrado['item_id'].map(señales).fillna('—')
+            filtrado = filtrar_screener_liquido(resumen, volumen_24h_minimo=self.spin_volumen.value())
+            clave_orden = self.combo_orden.currentData() or 'margen_neto'
+            filtrado = filtrado.sort_values(clave_orden, ascending=False).reset_index(drop=True)
 
-        self.label_contador.setText(f"{len(filtrado)} de {len(resumen)} ítems pasan el filtro de liquidez.")
-        self.modelo_tabla.set_dataframe(filtrado)
+            señales = _calcular_senales(self.db, filtrado['item_id'].tolist())
+            filtrado = filtrado.copy()
+            filtrado['señal'] = filtrado['item_id'].map(señales).fillna('—')
+
+            self.label_contador.setText(f"{len(filtrado)} de {len(resumen)} ítems pasan el filtro de liquidez.")
+            self.modelo_tabla.set_dataframe(filtrado)
+        except Exception as e:
+            self.label_contador.setText(f"No se pudo actualizar el screener: {e}")

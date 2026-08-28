@@ -44,21 +44,36 @@ class SelectorItems(QWidget):
         self._filtrar("")
 
     def _filtrar(self, texto):
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        texto = texto.strip()
-        if texto:
-            c.execute(
-                "SELECT item_id, name FROM items WHERE name LIKE ? ORDER BY name LIMIT 200",
-                (f"%{texto}%",),
-            )
-        else:
-            c.execute("SELECT item_id, name FROM items WHERE name IS NOT NULL ORDER BY name LIMIT 200")
-        filas = c.fetchall()
-        conn.close()
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            texto = texto.strip()
+            if texto:
+                c.execute(
+                    "SELECT item_id, name FROM items WHERE name LIKE ? ORDER BY name LIMIT 200",
+                    (f"%{texto}%",),
+                )
+            else:
+                c.execute("SELECT item_id, name FROM items WHERE name IS NOT NULL ORDER BY name LIMIT 200")
+            filas = c.fetchall()
+            conn.close()
+        except sqlite3.Error:
+            filas = []
 
         self.lista.blockSignals(True)
         self.lista.clear()
+        if not filas:
+            # Catálogo vacío (DB recién creada, antes de la primera
+            # recolección) o error de lectura -- un QListWidget sin filas
+            # y sin ninguna explicación se ve como si el widget estuviera
+            # roto, no como "todavía no hay datos".
+            aviso = QListWidgetItem(
+                "Sin ítems para elegir todavía"
+                if not texto
+                else f"Ningún ítem coincide con «{texto}»"
+            )
+            aviso.setFlags(Qt.NoItemFlags)
+            self.lista.addItem(aviso)
         for item_id, nombre in filas:
             elemento = QListWidgetItem(nombre or f"(ítem {item_id})")
             elemento.setData(Qt.UserRole, item_id)

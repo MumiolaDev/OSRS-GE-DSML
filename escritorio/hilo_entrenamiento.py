@@ -19,7 +19,7 @@ from recolector import _entrenar_desde_config
 
 
 class HiloEntrenamiento(QThread):
-    terminado = Signal(bool, str)  # (éxito, model_id)
+    terminado = Signal(bool, str, str)  # (éxito, model_id, mensaje)
 
     def __init__(self, db_path, cfg, calcular_metricas_horizonte=False, parent=None):
         super().__init__(parent)
@@ -28,12 +28,21 @@ class HiloEntrenamiento(QThread):
         self.calcular_metricas_horizonte = calcular_metricas_horizonte
 
     def run(self):
-        db = OSRSBaseDatos(self.db_path)
+        mensaje = ""
         try:
+            db = OSRSBaseDatos(self.db_path)
             exito = _entrenar_desde_config(
                 db, self.cfg, guardar_en_disco=True,
                 calcular_metricas_horizonte=self.calcular_metricas_horizonte,
             )
-        except Exception:
+            if not exito:
+                mensaje = "probablemente falta historial de precios suficiente para estos ítems"
+        except Exception as e:
+            # Cualquier excepción inesperada (ej. la DB está bloqueada por
+            # una escritura concurrente del recolector que tardó más que
+            # el busy_timeout de sqlite3, un ítem eliminado del catálogo a
+            # mitad de camino) se captura acá — este hilo nunca debe
+            # propagar una excepción no manejada, terminaría el proceso.
             exito = False
-        self.terminado.emit(exito, self.cfg['model_id'])
+            mensaje = str(e)
+        self.terminado.emit(exito, self.cfg['model_id'], mensaje)

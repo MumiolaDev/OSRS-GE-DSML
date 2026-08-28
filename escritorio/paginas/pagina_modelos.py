@@ -192,19 +192,29 @@ class PaginaModelos(QWidget):
         self._refrescar()
 
     def _refrescar(self):
-        self._modelos = self.db.listar_modelos_config()
-        filas = [
-            {
-                'nombre': cfg['nombre'],
-                'tipo': 'Regresor' if cfg['tipo'] == 'regresor' else 'Clasificador',
-                'cadencia': cfg['cadencia'].capitalize(),
-                'estado': 'Activo' if cfg['estado'] == 'activo' else 'Pausado',
-                'calidad': _resumen_calidad(self.db, cfg['model_id']),
-                'ultimo_entrenamiento': _formatear_fecha(cfg['ultimo_entrenamiento_ts']),
-            }
-            for cfg in self._modelos
-        ]
-        self.modelo_tabla.set_dataframe(pd.DataFrame(filas))
+        """
+        Envuelto en try/except: una falla acá (ej. la DB quedó bloqueada
+        un instante por una escritura concurrente del recolector) no debe
+        dejar la pestaña en un estado roto — se avisa y se mantiene lo que
+        ya se estaba mostrando, en vez de propagar la excepción hacia
+        arriba (podría interrumpir un click del usuario sin explicación).
+        """
+        try:
+            self._modelos = self.db.listar_modelos_config()
+            filas = [
+                {
+                    'nombre': cfg['nombre'],
+                    'tipo': 'Regresor' if cfg['tipo'] == 'regresor' else 'Clasificador',
+                    'cadencia': cfg['cadencia'].capitalize(),
+                    'estado': 'Activo' if cfg['estado'] == 'activo' else 'Pausado',
+                    'calidad': _resumen_calidad(self.db, cfg['model_id']),
+                    'ultimo_entrenamiento': _formatear_fecha(cfg['ultimo_entrenamiento_ts']),
+                }
+                for cfg in self._modelos
+            ]
+            self.modelo_tabla.set_dataframe(pd.DataFrame(filas))
+        except Exception as e:
+            self.label_estado.setText(f"No se pudo actualizar la lista de modelos: {e}")
 
     def _fila_seleccionada(self):
         indices = self.tabla.selectionModel().selectedRows()
@@ -225,7 +235,15 @@ class PaginaModelos(QWidget):
                 cadencia=valores['cadencia'], modo_seleccion='manual', item_ids=valores['item_ids'],
             )
         except ValueError as e:
+            # Topes técnicos (MAX_ITEMS_POR_MODELO / MAX_MODELOS_ACTIVOS).
             QMessageBox.warning(self, "No se pudo crear el modelo", str(e))
+            return
+        except sqlite3.IntegrityError as e:
+            # model_id duplicado -- no debería pasar en la práctica
+            # (_generar_model_id ya chequea unicidad justo antes), pero
+            # sqlite3.IntegrityError está documentado como posible en
+            # crear_modelo_config y no había ningún catch para eso.
+            QMessageBox.warning(self, "No se pudo crear el modelo", f"Ya existe un modelo con ese identificador: {e}")
             return
         self._refrescar()
         self.label_estado.setText(f"Modelo '{valores['nombre']}' creado — usá \"Entrenar ahora\" para la primera corrida.")
@@ -245,15 +263,24 @@ class PaginaModelos(QWidget):
         self._hilo_entrenamiento.terminado.connect(self._al_terminar_entrenamiento)
         self._hilo_entrenamiento.start()
 
-    def _al_terminar_entrenamiento(self, exito, model_id):
+    def _al_terminar_entrenamiento(self, exito, model_id, mensaje):
         self.boton_entrenar.setEnabled(True)
         if exito:
             self.label_estado.setText(f"'{model_id}' entrenado correctamente.")
         else:
-            self.label_estado.setText(
-                f"'{model_id}' no se pudo entrenar todavía — probablemente falta historial de precios para esos ítems."
-            )
+            self.label_estado.setText(f"'{model_id}' no se pudo entrenar todavía — {mensaje}.")
         self._refrescar()
+
+    def hilo_activo(self):
+        return self._hilo_entrenamiento is not None and self._hilo_entrenamiento.isRunning()
+
+    def esperar_para_cerrar(self):
+        """Llamado desde VentanaPrincipal.closeEvent — espera (hasta 30s,
+        un entrenamiento real puede tardar más que el hilo del recolector)
+        a que termine un entrenamiento en curso antes de dejar cerrar la
+        app, para no matar el hilo de XGBoost a mitad de un fit."""
+        if self.hilo_activo():
+            self._hilo_entrenamiento.wait(30000)
 
     def _alternar_estado_seleccionado(self):
         cfg = self._fila_seleccionada()
