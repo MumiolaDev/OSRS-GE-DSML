@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QMainWindow, QTabWidget
 
 from base_de_datos import OSRSBaseDatos
 from escritorio.paginas.pagina_inicio import PaginaInicio
+from escritorio.paginas.pagina_modelos import PaginaModelos
 from escritorio.paginas.pagina_oportunidades import PaginaOportunidades
 
 DB_PATH = 'data/osrs_ge.db'
@@ -28,10 +29,12 @@ class VentanaPrincipal(QMainWindow):
 
         self.pagina_inicio = PaginaInicio(db_path)
         self.pagina_oportunidades = PaginaOportunidades(self.db)
+        self.pagina_modelos = PaginaModelos(self.db, db_path)
 
         tabs = QTabWidget()
         tabs.addTab(self.pagina_inicio, "Inicio")
         tabs.addTab(self.pagina_oportunidades, "Oportunidades")
+        tabs.addTab(self.pagina_modelos, "Mis modelos")
         self.setCentralWidget(tabs)
 
     def closeEvent(self, event):
