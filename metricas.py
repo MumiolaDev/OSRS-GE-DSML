@@ -83,6 +83,70 @@ def calcular_profit_potencial(margen_neto, buy_limit):
     return margen_neto * buy_limit
 
 
+def dimensionar_oportunidad(margen_neto, buy_limit, volumen_1h_promedio, horas_horizonte, fraccion_participacion=0.15):
+    """
+    Ganancia estimada REALISTA de una oportunidad de flip — a diferencia de
+    calcular_profit_potencial (que asume que se llena el buy_limit completo,
+    optimista si el ítem no tiene volumen de mercado suficiente para
+    absorber esa cantidad sin que el precio se mueva en contra), acota las
+    unidades a min(buy_limit, volumen esperado en el horizonte *
+    fraccion_participacion). `fraccion_participacion` es un supuesto
+    conservador y configurable de "qué fracción del volumen horario típico
+    se puede capturar sin mover el precio" — no un número validado contra
+    microestructura real del Grand Exchange, ajustar si la experiencia real
+    de flipping sugiere que es muy optimista o muy conservador.
+    """
+    if margen_neto is None or buy_limit is None:
+        return None
+    volumen_capturable = (volumen_1h_promedio or 0) * horas_horizonte * fraccion_participacion
+    unidades = min(buy_limit, volumen_capturable)
+    return margen_neto * unidades
+
+
+def margen_neto_proyectado(avg_low_price_actual, avg_high_price_actual, avg_low_price_predicho, item_id):
+    """
+    Margen neto de comprar AHORA a avg_low_price_actual y vender en el
+    horizonte que pronosticó el modelo (prediccion.py/replay_historico.py),
+    que solo predice avg_low_price — no avg_high_price ni el spread. Se
+    estima el avg_high_price futuro como
+    avg_low_price_predicho * (avg_high_price_actual / avg_low_price_actual),
+    la misma aproximación de "spread congelado" que ya usa el pronóstico
+    recursivo (ver el docstring de prediccion.py): asume que la relación
+    compra/venta actual se mantiene. Es una aproximación de corto plazo, más
+    floja cuanto mayor el horizonte — usar accuracy_direccional por
+    horizonte (evaluacion.py / model_metrics) para calibrar hasta qué
+    horizonte esto sigue siendo razonable antes de alertar con él.
+
+    Descuenta el impuesto GE (calcular_impuesto_ge) sobre el precio de venta
+    proyectado: el modelo predice el precio crudo, sin impuesto, así que sin
+    este descuento la señal sobreestimaría la ganancia real.
+    """
+    if not avg_low_price_actual or not avg_high_price_actual:
+        return None
+    ratio_spread = avg_high_price_actual / avg_low_price_actual
+    avg_high_price_predicho = avg_low_price_predicho * ratio_spread
+    impuesto = calcular_impuesto_ge(avg_high_price_predicho, item_id)
+    return avg_high_price_predicho - avg_low_price_actual - impuesto
+
+
+def filtrar_screener_liquido(resumen_df, volumen_24h_minimo=100, margen_neto_minimo=None):
+    """
+    Filtra el screener (resumen_actual, o cualquier DataFrame con las mismas
+    columnas) a ítems con volumen_24h >= volumen_24h_minimo (y opcionalmente
+    margen_neto >= margen_neto_minimo). Sin este filtro, ítems casi sin
+    liquidez generan roi_pct absurdos — ej. un ítem de 1 gp con
+    volumen_24h=10 mostrando roi_pct=141600% en el historial real de esta
+    DB — que es ruido, no una oportunidad real de flip (nadie puede mover
+    volumen relevante en un ítem así). Usado por el dashboard (slider del
+    screener), alertas.py y backtest.py — un solo filtro compartido, no una
+    implementación distinta en cada uno.
+    """
+    filtrado = resumen_df[resumen_df['volumen_24h'] >= volumen_24h_minimo]
+    if margen_neto_minimo is not None:
+        filtrado = filtrado[filtrado['margen_neto'] >= margen_neto_minimo]
+    return filtrado.reset_index(drop=True)
+
+
 def pct_cambio(serie_precios):
     """% de cambio entre el primer y el último valor de una serie ordenada
     por tiempo ascendente."""
@@ -129,16 +193,22 @@ def tendencia_volumen(serie_volumen, ventana_reciente=6):
 
 
 # ---------------------------------------------------------------------------
-def calcular_resumen_item(db, item_id, nombre, buy_limit, tabla='precios_1h', horas_historial=720):
+def calcular_resumen_item(db, item_id, nombre, buy_limit, tabla='precios_1h', horas_historial=720, ahora_ts=None):
     """Calcula el set completo de métricas para un ítem, usando hasta
     `horas_historial` horas más recientes de su historial (default 720h =
-    30 días) para percentil/volatilidad/tendencia."""
-    # Filtra por fecha en la query SQL (desde_timestamp) en vez de traer todo
-    # el historial del ítem y recortar después con .tail() en pandas — con
-    # meses de datos acumulados, traer todo en cada refresh del screener se
-    # vuelve cada vez más lento.
-    desde = int(time.time()) - horas_historial * 3600
-    df = db.obtener_precios_id(item_id, tabla, desde_timestamp=desde)
+    30 días) para percentil/volatilidad/tendencia.
+
+    ahora_ts (opcional): en vez de usar el reloj real, calcula el resumen
+    "como si fuera" este momento — usado por el replay histórico
+    (replay_historico.py) para simular qué habría mostrado el screener en
+    un punto del pasado, sin ver datos posteriores ya backfilleados."""
+    # Filtra por fecha en la query SQL (desde_timestamp/hasta_timestamp) en
+    # vez de traer todo el historial del ítem y recortar después con
+    # .tail() en pandas — con meses de datos acumulados, traer todo en cada
+    # refresh del screener se vuelve cada vez más lento.
+    ahora = ahora_ts if ahora_ts is not None else int(time.time())
+    desde = ahora - horas_historial * 3600
+    df = db.obtener_precios_id(item_id, tabla, desde_timestamp=desde, hasta_timestamp=ahora_ts)
     if df.empty:
         return None
 
@@ -180,22 +250,32 @@ def calcular_resumen_item(db, item_id, nombre, buy_limit, tabla='precios_1h', ho
     }
 
 
-def calcular_resumen_todos(db, tabla='precios_1h', horas_historial=720):
+def calcular_resumen_todos(db, tabla='precios_1h', horas_historial=720, ahora_ts=None):
     """Recorre todos los ítems con datos en `tabla` y calcula su resumen.
     Devuelve una lista de dicts (una fila por ítem con datos suficientes),
-    lista para pasarse a OSRSBaseDatos.guardar_resumen()."""
+    lista para pasarse a OSRSBaseDatos.guardar_resumen().
+
+    ahora_ts (opcional): propagado a calcular_resumen_item para simular un
+    momento del pasado (replay histórico); también acota acá el universo de
+    ítems candidatos a los que ya tenían datos hasta ese momento — sin esto,
+    un ítem con datos solo posteriores a ahora_ts aparecería igual."""
     conn = sqlite3.connect(db.db_path)
     c = conn.cursor()
-    c.execute(f'''
+    query = f'''
         SELECT DISTINCT p.item_id, i.name, i.buy_limit
         FROM {tabla} p JOIN items i ON i.item_id = p.item_id
-    ''')
+    '''
+    params = []
+    if ahora_ts is not None:
+        query += ' WHERE p.timestamp <= ?'
+        params.append(ahora_ts)
+    c.execute(query, params)
     candidatos = c.fetchall()
     conn.close()
 
     resultados = []
     for item_id, nombre, buy_limit in candidatos:
-        fila = calcular_resumen_item(db, item_id, nombre, buy_limit, tabla, horas_historial)
+        fila = calcular_resumen_item(db, item_id, nombre, buy_limit, tabla, horas_historial, ahora_ts=ahora_ts)
         if fila:
             resultados.append(fila)
     return resultados

@@ -16,6 +16,12 @@ que el error compuesto crece con el horizonte — esto no es una serie de
 verdad, es una extrapolación de lo que el modelo cree que puede pasar; se
 recomienda no confiar en horizontes largos (más de ~6-12 pasos) sin
 validarlo contra lo que efectivamente ocurre.
+
+`pronosticar_clase_item` es el equivalente para el clasificador direccional
+(entrenador.entrenar_clasificador_direccional, variante productiva
+f2p10_clasif) — a diferencia de `pronosticar_item`, es de horizonte fijo a
+1 paso y sin recursión (el clasificador no tiene noción de horizontes
+mayores), así que no hay loop ni filas sintéticas.
 """
 
 import logging
@@ -27,17 +33,28 @@ import pandas as pd
 
 from preprocesamiento import construir_features, columnas_feature
 
-MODEL_PATH_DEFAULT = 'models/model_global_v1.pkl'
+# Segundos por paso, según la tabla de origen — usado tanto por el pronóstico
+# recursivo (pronosticar_item) como por el del clasificador (pronosticar_clase_item)
+# para calcular el timestamp del período que se está prediciendo.
+PASO_SEGUNDOS_POR_TABLA = {'precios_1h': 3600, 'precios_6h': 6 * 3600, 'precios_5m': 300}
 
 
-def cargar_modelo(model_path=MODEL_PATH_DEFAULT):
+def cargar_modelo(model_name=None, model_path=None):
     """
     Carga el bundle guardado por entrenador.py: no es solo el modelo, sino
     también los metadatos (feature_cols, categorías de item_id/members)
     necesarios para reproducir exactamente la misma codificación categórica
     que se usó al entrenar — ver el comentario en entrenador.py sobre por
     qué esto es imprescindible con XGBoost + enable_categorical.
+
+    Se puede pedir por `model_name` ('global_horario' o 'global_diario',
+    ver entrenador.MODEL_PATHS) o por `model_path` directo. Sin ninguno de
+    los dos, carga 'global_horario' — el modelo de cadencia rápida, el que
+    consumen las alertas casi en tiempo real (alertas.py).
     """
+    if model_path is None:
+        from entrenador import MODEL_NAME_HORARIO, MODEL_PATHS
+        model_path = MODEL_PATHS[model_name or MODEL_NAME_HORARIO]
     return joblib.load(model_path)
 
 
@@ -68,27 +85,46 @@ def _preparar_fila_prediccion(df, bundle, item_id, buy_limit, members):
     return X, precio_actual, ts_actual
 
 
-def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla='precios_1h'):
+def _obtener_item_info(db, item_id):
     """
-    Pronóstico recursivo a `n_pasos` períodos hacia adelante (horas, si
-    tabla='precios_1h') para un ítem. Devuelve un DataFrame con columnas
-    paso, timestamp, predicted_price — vacío si no hay suficiente historia
-    o el ítem no existe.
+    (buy_limit, members) del ítem desde la tabla `items`, o None si no está
+    registrado. Compartido por pronosticar_item y pronosticar_clase_item —
+    ambos necesitan estas dos columnas estáticas para armar la fila de
+    features (ver _preparar_fila_prediccion), antes ese lookup estaba
+    duplicado en los dos.
     """
-    if bundle is None:
-        bundle = cargar_modelo()
-
-    df = db.obtener_precios_id(item_id, tabla)
-    if df.empty:
-        logging.warning(f"Ítem {item_id}: sin datos en {tabla}, no se puede pronosticar")
-        return pd.DataFrame()
-    df = df.sort_values('timestamp').reset_index(drop=True)
-
     conn = sqlite3.connect(db.db_path)
     fila_item = conn.execute(
         'SELECT buy_limit, members FROM items WHERE item_id = ?', (item_id,)
     ).fetchone()
     conn.close()
+    return fila_item
+
+
+def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla='precios_1h', hasta_timestamp=None):
+    """
+    Pronóstico recursivo a `n_pasos` períodos hacia adelante (horas, si
+    tabla='precios_1h') para un ítem. Devuelve un DataFrame con columnas
+    paso, timestamp, predicted_price — vacío si no hay suficiente historia
+    o el ítem no existe.
+
+    hasta_timestamp (opcional): en vez de partir del último dato real
+    disponible, parte del último dato <= hasta_timestamp. Usado por
+    evaluacion.evaluar_horizontes() para simular "qué habría pronosticado
+    el modelo en este momento del pasado" y compararlo contra lo que
+    después efectivamente pasó (ya conocido en la DB) — a diferencia de un
+    pronóstico real hacia adelante, donde el futuro todavía no existe.
+    """
+    if bundle is None:
+        bundle = cargar_modelo()
+
+    df = db.obtener_precios_id(item_id, tabla, hasta_timestamp=hasta_timestamp)
+    if df.empty:
+        logging.warning(f"Ítem {item_id}: sin datos en {tabla}, no se puede pronosticar")
+        return pd.DataFrame()
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    fila_item = _obtener_item_info(db, item_id)
     if fila_item is None:
         logging.warning(f"Ítem {item_id}: no está en la tabla items")
         return pd.DataFrame()
@@ -96,7 +132,7 @@ def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla='precios_1h'):
 
     target_col = bundle['target_col']
     modelo = bundle['model']
-    paso_segundos = {'precios_1h': 3600, 'precios_6h': 6 * 3600, 'precios_5m': 300}.get(tabla, 3600)
+    paso_segundos = PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600)
 
     resultados = []
     for paso in range(1, n_pasos + 1):
@@ -128,6 +164,65 @@ def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla='precios_1h'):
         df = pd.concat([df, nueva_fila], ignore_index=True)
 
     return pd.DataFrame(resultados)
+
+
+def pronosticar_clase_item(db, item_id, bundle=None, tabla='precios_1h', hasta_timestamp=None):
+    """
+    Inferencia hacia adelante del clasificador direccional (entrenador.
+    entrenar_clasificador_direccional): UNA sola predicción a horizonte fijo
+    de 1 paso — a diferencia de pronosticar_item (regresor), que es
+    recursivo a n_pasos, el clasificador no tiene noción de horizontes > 1
+    (ver backtest.simular_clasificador* y CLAUDE.md), así que no hay loop
+    ni fila sintética que encadenar.
+
+    Devuelve un dict: {item_id, clase_predicha (0/1/2), label ('baja'/
+    'estable'/'sube', vía bundle['clase_labels']), probabilidades (dict
+    label->prob, de predict_proba), precio_actual, timestamp_dato,
+    timestamp_prediccion} — o None si no hay suficiente historia o el ítem
+    no existe.
+
+    bundle=None carga por default el modelo productivo f2p10_100gp_clasif
+    (import perezoso de entrenador, mismo patrón que cargar_modelo) — pasar
+    un bundle explícito (ej. desde el dashboard, ya cacheado) evita
+    recargarlo del disco en cada llamada.
+    """
+    if bundle is None:
+        from entrenador import MODEL_NAME_CLASIF_F2P_100GP
+        bundle = cargar_modelo(model_name=MODEL_NAME_CLASIF_F2P_100GP)
+
+    df = db.obtener_precios_id(item_id, tabla, hasta_timestamp=hasta_timestamp)
+    if df.empty:
+        logging.warning(f"Ítem {item_id}: sin datos en {tabla}, no se puede pronosticar clase")
+        return None
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    fila_item = _obtener_item_info(db, item_id)
+    if fila_item is None:
+        logging.warning(f"Ítem {item_id}: no está en la tabla items")
+        return None
+    buy_limit, members = fila_item
+
+    preparado = _preparar_fila_prediccion(df, bundle, item_id, buy_limit, members)
+    if preparado is None:
+        logging.warning(f"Ítem {item_id}: historia insuficiente para pronosticar clase")
+        return None
+    X, precio_actual, ts_actual = preparado
+
+    modelo = bundle['model']
+    clase_pred = int(modelo.predict(X)[0])
+    probs = modelo.predict_proba(X)[0]
+    clase_labels = bundle.get('clase_labels', {0: 'baja', 1: 'estable', 2: 'sube'})
+
+    paso_segundos = PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600)
+    return {
+        'item_id': item_id,
+        'clase_predicha': clase_pred,
+        'label': clase_labels[clase_pred],
+        'probabilidades': {clase_labels[i]: float(p) for i, p in enumerate(probs)},
+        'precio_actual': precio_actual,
+        'timestamp_dato': ts_actual,
+        'timestamp_prediccion': ts_actual + paso_segundos,
+    }
 
 
 if __name__ == '__main__':
