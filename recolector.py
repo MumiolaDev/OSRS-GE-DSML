@@ -7,10 +7,7 @@ from datetime import datetime
 from osrs_ge_api import OSRSGeAPI
 from base_de_datos import OSRSBaseDatos
 from metricas import calcular_resumen_todos
-from entrenador import (
-    entrenar_modelo_global, MODEL_NAME_HORARIO, MODEL_NAME_DIARIO,
-    entrenar_clasificador_direccional, MODEL_NAME_CLASIF_F2P_100GP,
-)
+from entrenador import entrenar_modelo_global, entrenar_clasificador_direccional
 from mantenimiento import ejecutar_mantenimiento_semanal
 
 
@@ -96,23 +93,65 @@ INTERVALS = {
 TABLA_POR_INTERVALO = {'5m': 'precios_5m', '1h': 'precios_1h', '6h': 'precios_6h'}
 
 
+def _entrenar_desde_config(db, cfg, guardar_en_disco=True, calcular_metricas_horizonte=False):
+    """
+    Despacha el entrenamiento de un modelo según su fila de modelos_config
+    (ver base_de_datos.OSRSBaseDatos._fila_a_modelo_config) hacia
+    entrenador.entrenar_modelo_global (tipo='regresor') o
+    entrenador.entrenar_clasificador_direccional (tipo='clasificador') — es
+    lo que le permite a job_horario/job_diario reentrenar tanto los 3
+    modelos productivos sembrados en la migración como cualquier modelo que
+    el usuario defina después desde la app de escritorio, sin distinguir
+    entre unos y otros.
+
+    modo_seleccion='manual' pasa item_ids tal cual (entrenador.py entonces
+    ignora n_items/solo_f2p); 'liquidez' pasa n_items/solo_f2p — más
+    precio_minimo/excluir_item_ids, que solo el clasificador soporta hoy
+    (ver entrenar_modelo_global/entrenar_clasificador_direccional).
+
+    Actualiza modelos_config.ultimo_entrenamiento_ts al terminar — no se
+    hace dentro de un try/except acá porque el llamador (job_horario/
+    job_diario) ya envuelve cada llamada a esta función en el suyo propio.
+    """
+    kwargs = dict(model_name=cfg['model_id'], guardar_en_disco=guardar_en_disco)
+    if cfg['modo_seleccion'] == 'manual':
+        kwargs['item_ids'] = cfg['item_ids']
+    else:
+        kwargs['n_items'] = cfg['n_items']
+        kwargs['solo_f2p'] = cfg['solo_f2p']
+
+    if cfg['tipo'] == 'clasificador':
+        if cfg['modo_seleccion'] != 'manual':
+            kwargs['precio_minimo'] = cfg['precio_minimo']
+            kwargs['excluir_item_ids'] = cfg['excluir_item_ids']
+        if cfg['umbral_pct'] is not None:
+            kwargs['umbral_pct'] = cfg['umbral_pct']
+        entrenar_clasificador_direccional(db, **kwargs)
+    else:
+        kwargs['calcular_metricas_horizonte'] = calcular_metricas_horizonte
+        entrenar_modelo_global(db, **kwargs)
+
+    db.actualizar_modelo_config(cfg['model_id'], ultimo_entrenamiento_ts=int(time.time()))
+
+
 def job_horario(db):
     """
     Corre cada hora (:05, unos minutos después de collect_1h para no competir
     por I/O/CPU con la recolección): refresca resumen_actual y reentrena
-    'global_horario' — la cadencia rápida, pensada para alertas casi en
-    tiempo real. Si el refresh del resumen falla, se salta el
-    reentrenamiento: obtener_top_items_liquidez() depende de que
-    resumen_actual esté fresca, así que reentrenar con una tabla vieja/vacía
-    no tiene sentido. También reentrena 'f2p10_100gp_clasif'
-    (entrenador.entrenar_clasificador_direccional), la variante productiva
-    del clasificador direccional — 10 ítems F2P más líquidos con
-    precio_minimo=100 y Steel bar excluido (item_id 2353), la configuración
-    que en el backtest walk-forward de 90 días convirtió una estrategia
-    perdedora (comprar a ciegas: -67.6M gp) en ganadora (+7.3M gp); la
-    variante sin filtro de precio no le ganaba a comprar a ciegas — en su
-    propio try/except independiente, para que un fallo ahí no afecte al
-    reentrenamiento de global_horario ni a las alertas.
+    todos los modelos de modelos_config con cadencia='horaria' y
+    estado='activo' (ver base_de_datos.py y _entrenar_desde_config) — antes
+    eran 2 llamadas hardcodeadas ('global_horario' y 'f2p10_100gp_clasif',
+    la variante productiva del clasificador direccional: 10 ítems F2P más
+    líquidos con precio_minimo=100 y Steel bar excluido, item_id 2353 — la
+    configuración que en el backtest walk-forward de 90 días convirtió una
+    estrategia perdedora, comprar a ciegas, -67.6M gp, en ganadora, +7.3M
+    gp), ahora conviven en la misma tabla con cualquier modelo que el
+    usuario defina desde la app de escritorio con esa misma cadencia. Si el
+    refresh del resumen falla, se salta el reentrenamiento entero:
+    obtener_top_items_liquidez() (la usan los modelos con
+    modo_seleccion='liquidez') depende de que resumen_actual esté fresca.
+    Cada modelo se reentrena en su propio try/except, para que un fallo en
+    uno no tumbe a los demás ni a las alertas.
     """
     try:
         logging.info("Job horario: refrescando resumen_actual...")
@@ -123,20 +162,12 @@ def job_horario(db):
         logging.error(f"Error refrescando resumen_actual, se omite el reentrenamiento: {e}")
         return
 
-    try:
-        logging.info("Job horario: reentrenando modelo global_horario...")
-        entrenar_modelo_global(db, model_name=MODEL_NAME_HORARIO)
-    except Exception as e:
-        logging.error(f"Error reentrenando global_horario: {e}")
-
-    try:
-        logging.info(f"Job horario: reentrenando {MODEL_NAME_CLASIF_F2P_100GP}...")
-        entrenar_clasificador_direccional(
-            db, n_items=10, solo_f2p=True, precio_minimo=100, excluir_item_ids=[2353],  # Steel bar
-            model_name=MODEL_NAME_CLASIF_F2P_100GP, guardar_en_disco=True,
-        )
-    except Exception as e:
-        logging.error(f"Error reentrenando {MODEL_NAME_CLASIF_F2P_100GP}: {e}")
+    for cfg in db.listar_modelos_config(cadencia='horaria', estado='activo'):
+        try:
+            logging.info(f"Job horario: reentrenando {cfg['model_id']} ({cfg['tipo']})...")
+            _entrenar_desde_config(db, cfg, guardar_en_disco=True)
+        except Exception as e:
+            logging.error(f"Error reentrenando {cfg['model_id']}: {e}")
 
     try:
         from alertas import evaluar_alertas
@@ -147,17 +178,24 @@ def job_horario(db):
 
 def job_diario(db):
     """
-    Corre una vez al día a las 03:00: reentrena 'global_diario' — la
-    cadencia estable, referencia de calidad de largo plazo — y calcula
-    métricas de horizonte (2..6 pasos, evaluacion.py), que son caras y por
-    eso no se calculan en cada corrida horaria. Reusa resumen_actual, ya
-    refrescada por job_horario en la misma hora — no la recalcula de nuevo.
+    Corre una vez al día a las 03:00: reentrena todos los modelos de
+    modelos_config con cadencia='diaria' y estado='activo' (antes,
+    solo 'global_diario' hardcodeado) y calcula métricas de horizonte
+    (2..6 pasos, evaluacion.py) para los de tipo='regresor' — el
+    clasificador no tiene esa noción, ver entrenador.py — que son caras y
+    por eso no se calculan en cada corrida horaria. Reusa resumen_actual,
+    ya refrescada por job_horario en la misma hora — no la recalcula de
+    nuevo.
     """
-    try:
-        logging.info("Job diario: reentrenando modelo global_diario...")
-        entrenar_modelo_global(db, model_name=MODEL_NAME_DIARIO, calcular_metricas_horizonte=True)
-    except Exception as e:
-        logging.error(f"Error reentrenando global_diario: {e}")
+    for cfg in db.listar_modelos_config(cadencia='diaria', estado='activo'):
+        try:
+            logging.info(f"Job diario: reentrenando {cfg['model_id']} ({cfg['tipo']})...")
+            _entrenar_desde_config(
+                db, cfg, guardar_en_disco=True,
+                calcular_metricas_horizonte=(cfg['tipo'] == 'regresor'),
+            )
+        except Exception as e:
+            logging.error(f"Error reentrenando {cfg['model_id']}: {e}")
 
 
 def job_semanal(db):

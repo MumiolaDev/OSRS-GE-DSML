@@ -73,11 +73,21 @@ def entrenar_modelo_global(
     modo_evaluacion='holdout',
     calcular_metricas_horizonte=False,
     solo_f2p=False,
+    item_ids=None,
 ):
     """
-    Entrena un modelo XGBoost sobre los `n_items` ítems más líquidos,
-    prediciendo el log-retorno del siguiente período (ver preprocesamiento.py
-    para el porqué de trabajar en espacio de retorno y no precio crudo).
+    Entrena un modelo XGBoost sobre un universo de ítems, prediciendo el
+    log-retorno del siguiente período (ver preprocesamiento.py para el
+    porqué de trabajar en espacio de retorno y no precio crudo).
+
+    item_ids (opcional): lista explícita de ítems a usar en vez de derivar
+    el universo desde obtener_top_items_liquidez[_hasta] con n_items/
+    solo_f2p — es lo que permite que un modelo definido por el usuario
+    (base_de_datos.modelos_config con modo_seleccion='manual', ver
+    recolector._entrenar_desde_config) entrene sobre exactamente los ítems
+    que eligió a mano, no sobre un ranking de liquidez. Cuando se pasa,
+    n_items/solo_f2p se ignoran por completo — el default (None) mantiene
+    el comportamiento de siempre.
 
     model_name/model_path: distingue 'global_horario' de 'global_diario'
     (ver MODEL_PATHS arriba) — mismo código, dos cadencias de reentrenamiento
@@ -115,15 +125,18 @@ def entrenar_modelo_global(
     """
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
 
-    if ahora_ts is None:
-        item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p)
+    if item_ids is not None:
+        logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
     else:
-        item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p)
-    logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
+        if ahora_ts is None:
+            item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p)
+        else:
+            item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p)
+        logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
     if not item_ids:
         logging.error(
-            f"[{model_name}] Sin ítems líquidos disponibles — correr metricas.py antes de "
-            "entrenar en modo en vivo (o esperar más historial acumulado en modo replay)."
+            f"[{model_name}] Sin ítems disponibles — correr metricas.py antes de entrenar en "
+            "modo en vivo (o esperar más historial acumulado en modo replay)."
         )
         return
 
@@ -306,6 +319,7 @@ def entrenar_clasificador_direccional(
     solo_f2p=False,
     precio_minimo=None,
     excluir_item_ids=None,
+    item_ids=None,
 ):
     """
     Entrena un XGBClassifier de 3 clases (baja/estable/sube) sobre el mismo
@@ -314,6 +328,11 @@ def entrenar_clasificador_direccional(
     cuadrático, no accuracy de signo — los movimientos chicos cerca de cero,
     que son la mayoría, pesan igual que uno grande en esa pérdida), este
     modelo optimiza directamente la clase correcta.
+
+    item_ids (opcional): ver entrenar_modelo_global — lista explícita de
+    ítems, en vez de derivar el universo desde obtener_top_items_liquidez
+    con n_items/solo_f2p/precio_minimo/excluir_item_ids (que se ignoran
+    por completo cuando se pasa).
 
     solo_f2p: restringe el universo de ítems a free-to-play (ver
     obtener_top_items_liquidez) — ej. n_items=10, solo_f2p=True entrena
@@ -366,13 +385,16 @@ def entrenar_clasificador_direccional(
     """
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
 
-    if ahora_ts is None:
-        item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+    if item_ids is not None:
+        logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
     else:
-        item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
-    logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
+        if ahora_ts is None:
+            item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+        else:
+            item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+        logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
     if not item_ids:
-        logging.error(f"[{model_name}] Sin ítems líquidos disponibles.")
+        logging.error(f"[{model_name}] Sin ítems disponibles.")
         return None, None
 
     dataset = build_training_set(db, item_ids, hasta_timestamp=ahora_ts)
