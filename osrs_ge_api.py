@@ -117,12 +117,7 @@ class OSRSGeAPI:
                     'low_volume': data.get('lowPriceVolume', 0)
                 })
 
-        df = pd.DataFrame(processed_data)
-        #df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-
-        return df
-
-
+        return pd.DataFrame(processed_data)
 
     def _procesar_prices(self, data_response_json):
         processed_data = []
@@ -151,9 +146,6 @@ class OSRSGeAPI:
                     'high_volume': data.get('highPriceVolume', 0),
                     'low_volume': data.get('lowPriceVolume', 0)
                 })
-        df = pd.DataFrame(processed_data)
-        #df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-
-        return df
+        return pd.DataFrame(processed_data)
 
 
