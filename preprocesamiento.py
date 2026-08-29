@@ -121,7 +121,7 @@ def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6]):
     return df[feature_cols + ['timestamp_target', 'price_actual', 'price_target', 'target']]
 
 
-def build_training_set(db, item_ids, tabla='precios_1h', hasta_timestamp=None, **kwargs):
+def build_training_set(db, item_ids, tabla='precios_1h', hasta_timestamp=None, desde_timestamp=None, **kwargs):
     """
     Arma el dataset de entrenamiento del modelo global: recorre `item_ids`,
     genera features por ítem con preprocess_item, les agrega el item_id y
@@ -133,6 +133,17 @@ def build_training_set(db, item_ids, tabla='precios_1h', hasta_timestamp=None, *
     fuera" un momento del pasado (replay_historico.py), en vez de siempre
     usar todo lo que ya esté cargado en la tabla.
 
+    desde_timestamp (opcional): acota cada ítem a datos con
+    timestamp >= desde_timestamp — es la "ventana" de entrenamiento
+    (entrenador.py la deriva de modelos_config.ventana_dias). Sin esto
+    (default None), se usa todo el historial disponible hasta
+    hasta_timestamp, el comportamiento de siempre. Nota: como los lags/
+    medias móviles necesitan unas pocas filas anteriores a cada punto para
+    calcularse, las primeras filas dentro de la ventana quedan sin
+    suficiente historia y se descartan (dropna() en preprocess_item) — con
+    ventanas chicas (ej. 24h a 5m) esto recorta una fracción notoria del
+    total, no solo un puñado de filas.
+
     kwargs se pasan a preprocess_item (target_col, lags, ma_windows).
     """
     # Una sola query para todos los ítems (obtener_precios_multi) en vez de
@@ -140,7 +151,7 @@ def build_training_set(db, item_ids, tabla='precios_1h', hasta_timestamp=None, *
     # SQLite por separado era el cuello de botella real de esta función,
     # sobre todo repetido en cada checkpoint del replay histórico
     # (replay_historico.py).
-    precios_todos = db.obtener_precios_multi(item_ids, tabla, hasta_timestamp=hasta_timestamp)
+    precios_todos = db.obtener_precios_multi(item_ids, tabla, desde_timestamp=desde_timestamp, hasta_timestamp=hasta_timestamp)
 
     frames = []
     for item_id, df in precios_todos.groupby('item_id'):

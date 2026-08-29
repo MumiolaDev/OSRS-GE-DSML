@@ -308,7 +308,23 @@ class OSRSBaseDatos:
                     cadencia TEXT,
                     estado TEXT DEFAULT 'activo',
                     creado_en INTEGER,
-                    ultimo_entrenamiento_ts INTEGER)''')
+                    ultimo_entrenamiento_ts INTEGER,
+                    tabla TEXT DEFAULT 'precios_1h',
+                    ventana_dias REAL)''')
+
+        # tabla/ventana_dias: agregados después de la primera versión de
+        # modelos_config (ver el bullet de más abajo, mismo patrón que el
+        # resto de _migrar_esquema) -- tabla es la granularidad de precios
+        # sobre la que entrena el modelo (precios_5m/1h/6h, antes siempre
+        # implícitamente precios_1h); ventana_dias acota cuánto historial
+        # hacia atrás usa cada entrenamiento (None = todo el disponible,
+        # el comportamiento de siempre). CREATE TABLE IF NOT EXISTS no
+        # alcanza para una DB que ya tenía la tabla sin estas columnas.
+        columnas_modelos_config = {row[1] for row in c.execute('PRAGMA table_info(modelos_config)')}
+        if 'tabla' not in columnas_modelos_config:
+            c.execute("ALTER TABLE modelos_config ADD COLUMN tabla TEXT DEFAULT 'precios_1h'")
+        if 'ventana_dias' not in columnas_modelos_config:
+            c.execute('ALTER TABLE modelos_config ADD COLUMN ventana_dias REAL')
 
         conn.commit()
 
@@ -338,22 +354,26 @@ class OSRSBaseDatos:
             (
                 'global_horario', 'Global horario (200 ítems líquidos)', 'regresor', 'liquidez',
                 None, 200, 0, None, None, 5, '[3, 6]', 1, None, 'horaria', 'activo', ahora, None,
+                'precios_1h', None,
             ),
             (
                 'global_diario', 'Global diario (200 ítems líquidos)', 'regresor', 'liquidez',
                 None, 200, 0, None, None, 5, '[3, 6]', 1, None, 'diaria', 'activo', ahora, None,
+                'precios_1h', None,
             ),
             (
                 'f2p10_100gp_clasif', 'Clasificador F2P (10 ítems, ≥100gp)', 'clasificador', 'liquidez',
                 None, 10, 1, 100, json.dumps([2353]), 5, '[3, 6]', 1, 0.5, 'horaria', 'activo', ahora, None,
+                'precios_1h', None,
             ),
         ]
         c.executemany(
             '''INSERT OR IGNORE INTO modelos_config (
                 model_id, nombre, tipo, modo_seleccion, item_ids, n_items, solo_f2p,
                 precio_minimo, excluir_item_ids, lags, ma_windows, horizonte_horas,
-                umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts,
+                tabla, ventana_dias
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             filas,
         )
         conn.commit()
@@ -371,6 +391,7 @@ class OSRSBaseDatos:
             model_id, nombre, tipo, modo_seleccion, item_ids, n_items, solo_f2p,
             precio_minimo, excluir_item_ids, lags, ma_windows, horizonte_horas,
             umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts,
+            tabla, ventana_dias,
         ) = fila
         return {
             'model_id': model_id,
@@ -390,13 +411,15 @@ class OSRSBaseDatos:
             'estado': estado,
             'creado_en': creado_en,
             'ultimo_entrenamiento_ts': ultimo_entrenamiento_ts,
+            'tabla': tabla or 'precios_1h',
+            'ventana_dias': ventana_dias,
         }
 
     def crear_modelo_config(
         self, model_id, nombre, tipo, cadencia, modo_seleccion='manual',
         item_ids=None, n_items=None, solo_f2p=False, precio_minimo=None,
         excluir_item_ids=None, lags=5, ma_windows=None, horizonte_horas=1,
-        umbral_pct=None,
+        umbral_pct=None, tabla='precios_1h', ventana_dias=None,
     ):
         """
         Da de alta un modelo definido por el usuario. model_id es elegido
@@ -414,6 +437,18 @@ class OSRSBaseDatos:
         productivos preexistentes): item_ids queda en None, se arma en
         entrenamiento vía obtener_top_items_liquidez[_hasta] con estos
         parámetros.
+
+        tabla ('precios_5m'|'precios_1h'|'precios_6h', default 'precios_1h'
+        — el comportamiento de siempre): granularidad de precios sobre la
+        que entrena el modelo. ventana_dias (opcional, None = todo el
+        historial disponible, el comportamiento de siempre): acota cada
+        entrenamiento a los últimos `ventana_dias` días relativos al
+        momento de entrenar — ver entrenador.entrenar_modelo_global/
+        entrenar_clasificador_direccional. Ninguno de los dos se valida acá
+        (los valores razonables dependen de qué tan corta puede ser una
+        ventana antes de quedarse sin datos suficientes para lags/medias
+        móviles — eso ya lo maneja entrenador.py devolviendo False/None si
+        no hay suficiente).
 
         Lanza ValueError si modo_seleccion='manual' pide más de
         MAX_ITEMS_POR_MODELO ítems, o si cadencia != 'manual' y ya hay
@@ -441,15 +476,16 @@ class OSRSBaseDatos:
             '''INSERT INTO modelos_config (
                 model_id, nombre, tipo, modo_seleccion, item_ids, n_items, solo_f2p,
                 precio_minimo, excluir_item_ids, lags, ma_windows, horizonte_horas,
-                umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'activo',?,NULL)''',
+                umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts,
+                tabla, ventana_dias
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'activo',?,NULL,?,?)''',
             (
                 model_id, nombre, tipo, modo_seleccion,
                 json.dumps(item_ids) if item_ids is not None else None,
                 n_items, int(bool(solo_f2p)), precio_minimo,
                 json.dumps(excluir_item_ids) if excluir_item_ids else None,
                 lags, json.dumps(ma_windows or [3, 6]), horizonte_horas, umbral_pct,
-                cadencia, ahora,
+                cadencia, ahora, tabla, ventana_dias,
             ),
         )
         conn.commit()

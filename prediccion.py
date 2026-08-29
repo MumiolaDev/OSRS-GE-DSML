@@ -101,12 +101,20 @@ def _obtener_item_info(db, item_id):
     return fila_item
 
 
-def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla='precios_1h', hasta_timestamp=None):
+def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla=None, hasta_timestamp=None):
     """
     Pronóstico recursivo a `n_pasos` períodos hacia adelante (horas, si
     tabla='precios_1h') para un ítem. Devuelve un DataFrame con columnas
     paso, timestamp, predicted_price — vacío si no hay suficiente historia
     o el ítem no existe.
+
+    tabla (opcional): si no se pasa, se usa bundle['tabla'] (la
+    granularidad con la que se entrenó ese modelo específico, ver
+    entrenador.py) — con bundles viejos sin esa clave, 'precios_1h' como
+    antes. Pasar `tabla` a mano solo tiene sentido para forzar una
+    granularidad distinta de la de entrenamiento, algo que en general
+    produce features con una escala temporal distinta a la que el modelo
+    aprendió (train/serve skew) — no hacerlo salvo que sepas por qué.
 
     hasta_timestamp (opcional): en vez de partir del último dato real
     disponible, parte del último dato <= hasta_timestamp. Usado por
@@ -117,6 +125,8 @@ def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla='precios_1h', ha
     """
     if bundle is None:
         bundle = cargar_modelo()
+    if tabla is None:
+        tabla = bundle.get('tabla', 'precios_1h')
 
     df = db.obtener_precios_id(item_id, tabla, hasta_timestamp=hasta_timestamp)
     if df.empty:
@@ -166,7 +176,7 @@ def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla='precios_1h', ha
     return pd.DataFrame(resultados)
 
 
-def pronosticar_clase_item(db, item_id, bundle=None, tabla='precios_1h', hasta_timestamp=None):
+def pronosticar_clase_item(db, item_id, bundle=None, tabla=None, hasta_timestamp=None):
     """
     Inferencia hacia adelante del clasificador direccional (entrenador.
     entrenar_clasificador_direccional): UNA sola predicción a horizonte fijo
@@ -174,6 +184,9 @@ def pronosticar_clase_item(db, item_id, bundle=None, tabla='precios_1h', hasta_t
     recursivo a n_pasos, el clasificador no tiene noción de horizontes > 1
     (ver backtest.simular_clasificador* y CLAUDE.md), así que no hay loop
     ni fila sintética que encadenar.
+
+    tabla (opcional): ver pronosticar_item — si no se pasa, se usa
+    bundle['tabla'] (con qué granularidad se entrenó ese modelo).
 
     Devuelve un dict: {item_id, clase_predicha (0/1/2), label ('baja'/
     'estable'/'sube', vía bundle['clase_labels']), probabilidades (dict
@@ -189,6 +202,8 @@ def pronosticar_clase_item(db, item_id, bundle=None, tabla='precios_1h', hasta_t
     if bundle is None:
         from entrenador import MODEL_NAME_CLASIF_F2P_100GP
         bundle = cargar_modelo(model_name=MODEL_NAME_CLASIF_F2P_100GP)
+    if tabla is None:
+        tabla = bundle.get('tabla', 'precios_1h')
 
     df = db.obtener_precios_id(item_id, tabla, hasta_timestamp=hasta_timestamp)
     if df.empty:

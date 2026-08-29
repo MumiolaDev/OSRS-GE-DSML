@@ -109,6 +109,12 @@ def _entrenar_desde_config(db, cfg, guardar_en_disco=True, calcular_metricas_hor
     precio_minimo/excluir_item_ids, que solo el clasificador soporta hoy
     (ver entrenar_modelo_global/entrenar_clasificador_direccional).
 
+    tabla/ventana_dias se pasan siempre tal cual estén en la config
+    (default 'precios_1h'/None si son NULL en la fila, el comportamiento
+    de siempre) — es lo que permite que un modelo de modelos_config entrene
+    sobre precios_5m/6h con una ventana acotada, no solo precios_1h con
+    todo el historial.
+
     Actualiza modelos_config.ultimo_entrenamiento_ts SOLO si el
     entrenamiento efectivamente corrió (no en un corte temprano por falta
     de ítems/historial suficiente, ver el valor de retorno de
@@ -121,7 +127,10 @@ def _entrenar_desde_config(db, cfg, guardar_en_disco=True, calcular_metricas_hor
     Devuelve True/False según si entrenó de verdad — lo usa
     escritorio/paginas/pagina_modelos.py para el botón "Entrenar ahora".
     """
-    kwargs = dict(model_name=cfg['model_id'], guardar_en_disco=guardar_en_disco)
+    kwargs = dict(
+        model_name=cfg['model_id'], guardar_en_disco=guardar_en_disco,
+        tabla=cfg.get('tabla') or 'precios_1h', ventana_dias=cfg.get('ventana_dias'),
+    )
     if cfg['modo_seleccion'] == 'manual':
         kwargs['item_ids'] = cfg['item_ids']
     else:

@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import joblib
 import numpy as np
@@ -74,6 +75,8 @@ def entrenar_modelo_global(
     calcular_metricas_horizonte=False,
     solo_f2p=False,
     item_ids=None,
+    tabla='precios_1h',
+    ventana_dias=None,
 ):
     """
     Entrena un modelo XGBoost sobre un universo de ítems, prediciendo el
@@ -88,6 +91,25 @@ def entrenar_modelo_global(
     que eligió a mano, no sobre un ranking de liquidez. Cuando se pasa,
     n_items/solo_f2p se ignoran por completo — el default (None) mantiene
     el comportamiento de siempre.
+
+    tabla ('precios_5m'|'precios_1h'|'precios_6h', default 'precios_1h' —
+    el comportamiento de siempre): granularidad de precios sobre la que se
+    entrena. Se guarda en el bundle (bundle['tabla']) para que
+    prediccion.py sepa contra qué tabla pedir el historial al pronosticar
+    — sin esto, un modelo entrenado sobre precios_6h pero consultado con
+    la tabla equivocada en inferencia tendría fuga de escala temporal
+    (train/serve skew) sin ningún error visible, los lags/medias móviles
+    significarían una cosa distinta a la que el modelo aprendió.
+
+    ventana_dias (opcional, default None = todo el historial disponible,
+    el comportamiento de siempre): acota el dataset de entrenamiento a los
+    últimos `ventana_dias` días relativos a `ahora_ts` (o a ahora mismo, en
+    vivo) — ver preprocesamiento.build_training_set. Pensado para modelos
+    de ítems puntuales (ver base_de_datos.modelos_config), donde entrenar
+    con años de historial de un solo ítem no necesariamente es mejor que
+    una ventana reciente más representativa del régimen actual del mercado
+    — no hay un valor "correcto" universal, es una decisión del usuario al
+    crear el modelo.
 
     model_name/model_path: distingue 'global_horario' de 'global_diario'
     (ver MODEL_PATHS arriba) — mismo código, dos cadencias de reentrenamiento
@@ -148,7 +170,12 @@ def entrenar_modelo_global(
         )
         return False
 
-    dataset = build_training_set(db, item_ids, hasta_timestamp=ahora_ts)
+    desde_ts = None
+    if ventana_dias is not None:
+        referencia = ahora_ts if ahora_ts is not None else int(time.time())
+        desde_ts = int(referencia - ventana_dias * 86400)
+
+    dataset = build_training_set(db, item_ids, tabla=tabla, hasta_timestamp=ahora_ts, desde_timestamp=desde_ts)
     if dataset.empty:
         logging.error(f"[{model_name}] No se pudo construir el dataset de entrenamiento (sin datos suficientes).")
         return False
@@ -213,6 +240,7 @@ def entrenar_modelo_global(
         'item_id_categories': dataset['item_id'].cat.categories,
         'members_categories': dataset['members'].cat.categories,
         'target_col': 'avg_low_price',
+        'tabla': tabla,
         'lags': 5,
         'ma_windows': [3, 6],
     }
@@ -330,6 +358,8 @@ def entrenar_clasificador_direccional(
     precio_minimo=None,
     excluir_item_ids=None,
     item_ids=None,
+    tabla='precios_1h',
+    ventana_dias=None,
 ):
     """
     Entrena un XGBClassifier de 3 clases (baja/estable/sube) sobre el mismo
@@ -343,6 +373,11 @@ def entrenar_clasificador_direccional(
     ítems, en vez de derivar el universo desde obtener_top_items_liquidez
     con n_items/solo_f2p/precio_minimo/excluir_item_ids (que se ignoran
     por completo cuando se pasa).
+
+    tabla/ventana_dias: ver entrenar_modelo_global — misma granularidad de
+    precios y misma ventana de historial configurables, mismo motivo
+    (bundle['tabla'] evita el train/serve skew de inferir con la tabla
+    equivocada).
 
     solo_f2p: restringe el universo de ítems a free-to-play (ver
     obtener_top_items_liquidez) — ej. n_items=10, solo_f2p=True entrena
@@ -407,7 +442,12 @@ def entrenar_clasificador_direccional(
         logging.error(f"[{model_name}] Sin ítems disponibles.")
         return None, None
 
-    dataset = build_training_set(db, item_ids, hasta_timestamp=ahora_ts)
+    desde_ts = None
+    if ventana_dias is not None:
+        referencia = ahora_ts if ahora_ts is not None else int(time.time())
+        desde_ts = int(referencia - ventana_dias * 86400)
+
+    dataset = build_training_set(db, item_ids, tabla=tabla, hasta_timestamp=ahora_ts, desde_timestamp=desde_ts)
     if dataset.empty:
         logging.error(f"[{model_name}] No se pudo construir el dataset de entrenamiento.")
         return None, None
@@ -477,6 +517,7 @@ def entrenar_clasificador_direccional(
             'item_id_categories': dataset['item_id'].cat.categories,
             'members_categories': dataset['members'].cat.categories,
             'target_col': 'avg_low_price',
+            'tabla': tabla,
             'lags': 5,
             'ma_windows': [3, 6],
             'umbral_pct': umbral_pct,
