@@ -38,14 +38,14 @@ class VentanaPrincipal(QMainWindow):
     def __init__(self, db_path=DB_PATH):
         super().__init__()
         self.setWindowTitle("OSRS GE Predictor")
-        self.resize(1000, 700)
+        self.resize(800, 600)
 
         self.db = self._abrir_db_con_fallback(db_path)
         db_path_efectivo = self.db.db_path
 
         tabs = QTabWidget()
 
-        self.pagina_inicio = PaginaInicio(db_path_efectivo)
+        self.pagina_inicio = PaginaInicio(self.db, db_path_efectivo)
         tabs.addTab(self.pagina_inicio, "Inicio")
 
         self.pagina_oportunidades = self._agregar_pagina_segura(

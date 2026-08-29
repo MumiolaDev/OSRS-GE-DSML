@@ -70,8 +70,16 @@ def calcular_checkpoints(desde_ts, hasta_ts, minuto_offset_horario=MINUTO_OFFSET
     return checkpoints
 
 
-def ejecutar_replay(db, desde_ts, hasta_ts):
+def ejecutar_replay(db, desde_ts, hasta_ts, on_progreso=None):
     """
+    on_progreso (opcional): callback `f(fase, actual, total)`, llamado con
+    fase='replay' en cada checkpoint procesado (corrido, saltado o
+    fallido) — sin dependencia de ningún framework, misma idea que
+    recolector.backfill_faltantes. Es lo que le permite a
+    escritorio/hilo_recolector.py mostrar progreso real durante un replay
+    largo en vez de dejar la UI sin ninguna señal por potencialmente
+    minutos u horas.
+
     Recorre calcular_checkpoints(desde_ts, hasta_ts) en orden cronológico y,
     para cada uno que no haya corrido todavía (db.existe_checkpoint), llama
     entrenar_modelo_global() con modo_evaluacion='walkforward' y
@@ -99,6 +107,18 @@ def ejecutar_replay(db, desde_ts, hasta_ts):
 
         if db.existe_checkpoint(model_name, ts, 'walkforward'):
             n_saltados += 1
+            # El `continue` saltea el try/except de abajo, pero on_progreso
+            # y el log periódico tienen que dispararse igual acá -- si no,
+            # un replay que reanuda uno ya casi terminado (la mayoría de
+            # los checkpoints ya corridos) deja la barra de progreso
+            # congelada porque casi todas las iteraciones pasan por acá.
+            if on_progreso is not None:
+                on_progreso('replay', n_corridos + n_saltados + n_fallidos, len(checkpoints))
+            if (n_corridos + n_saltados + n_fallidos) % 50 == 0:
+                logging.info(
+                    f"Replay en curso: {n_corridos} corridos, {n_saltados} ya existentes, "
+                    f"{n_fallidos} fallidos, de {len(checkpoints)} checkpoints totales"
+                )
             continue
 
         try:
@@ -110,6 +130,9 @@ def ejecutar_replay(db, desde_ts, hasta_ts):
         except Exception as e:
             logging.error(f"Replay: error en checkpoint {tipo} ts={ts}: {e}")
             n_fallidos += 1
+
+        if on_progreso is not None:
+            on_progreso('replay', n_corridos + n_saltados + n_fallidos, len(checkpoints))
 
         if (n_corridos + n_saltados + n_fallidos) % 50 == 0:
             logging.info(

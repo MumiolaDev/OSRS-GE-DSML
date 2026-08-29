@@ -13,7 +13,9 @@ actualización, los topes técnicos (MAX_ITEMS_POR_MODELO/
 MAX_MODELOS_ACTIVOS) y borrado.
 """
 import os
+import sqlite3
 import tempfile
+import time
 
 import pytest
 
@@ -137,3 +139,71 @@ class TestEliminarModeloConfig:
 
     def test_id_inexistente_no_falla(self, db):
         assert db.eliminar_modelo_config('no_existe') == 0
+
+
+class TestObtenerResumenDatos:
+    """
+    obtener_resumen_datos() -- usado por escritorio/paginas/pagina_inicio.py
+    para el panel "Datos disponibles" (ver el plan de la fase "pestaña
+    Inicio: estado detallado, progreso y datos disponibles").
+    """
+
+    def test_tablas_vacias(self, db):
+        resumen = db.obtener_resumen_datos()
+        assert set(resumen.keys()) == {'precios_5m', 'precios_1h', 'precios_6h', 'precios_1h_diario'}
+        for info in resumen.values():
+            assert info == {'filas': 0, 'desde_ts': None, 'hasta_ts': None, 'dias_historial': None}
+
+    def test_precios_1h_con_datos(self, db):
+        ahora = (int(time.time()) // 3600) * 3600
+        conn = sqlite3.connect(db.db_path)
+        c = conn.cursor()
+        filas = [(1, ahora - h * 3600, 100, 90, 10, 10) for h in range(48, 0, -1)]  # 48 filas, últimas 47h
+        c.executemany(
+            'INSERT INTO precios_1h (item_id, timestamp, avg_high_price, avg_low_price, high_volume, low_volume) VALUES (?,?,?,?,?,?)',
+            filas,
+        )
+        conn.commit()
+        conn.close()
+
+        info = db.obtener_resumen_datos()['precios_1h']
+        assert info['filas'] == 48
+        assert info['desde_ts'] == ahora - 48 * 3600
+        assert info['hasta_ts'] == ahora - 1 * 3600
+        assert info['dias_historial'] == pytest.approx(47 / 24)
+
+    def test_precios_1h_diario_usa_la_columna_fecha(self, db):
+        # precios_1h_diario usa `fecha`, no `timestamp`, como columna de
+        # tiempo -- confirma que obtener_resumen_datos() no la confunde
+        # con las otras 3 tablas.
+        ahora = (int(time.time()) // 86400) * 86400
+        conn = sqlite3.connect(db.db_path)
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO precios_1h_diario (item_id, fecha, avg_high_price, avg_low_price, high_volume, low_volume) VALUES (1, ?, 100, 90, 500, 500)',
+            (ahora - 5 * 86400,),
+        )
+        c.execute(
+            'INSERT INTO precios_1h_diario (item_id, fecha, avg_high_price, avg_low_price, high_volume, low_volume) VALUES (1, ?, 100, 90, 500, 500)',
+            (ahora,),
+        )
+        conn.commit()
+        conn.close()
+
+        info = db.obtener_resumen_datos()['precios_1h_diario']
+        assert info['filas'] == 2
+        assert info['dias_historial'] == pytest.approx(5.0)
+
+    def test_tabla_con_un_solo_dato_da_cero_dias(self, db):
+        conn = sqlite3.connect(db.db_path)
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO precios_6h (item_id, timestamp, avg_high_price, avg_low_price, high_volume, low_volume) VALUES (1, ?, 100, 90, 10, 10)',
+            (int(time.time()),),
+        )
+        conn.commit()
+        conn.close()
+
+        info = db.obtener_resumen_datos()['precios_6h']
+        assert info['filas'] == 1
+        assert info['dias_historial'] == 0

@@ -35,13 +35,31 @@ class HiloRecolector(QThread):
     señales/slots (Qt las entrega en el hilo del receptor automáticamente
     cuando emisor y receptor viven en hilos distintos).
     """
-    estado_cambio = Signal(str)  # texto legible del estado actual, para un QLabel
-    error = Signal(str)          # error no recuperable (ej. no se pudo abrir la DB)
+    estado_cambio = Signal(str)       # texto legible del estado actual, para un QLabel
+    progreso = Signal(str, int, int)  # (fase, actual, total) -- solo durante backfill/replay
+    error = Signal(str)               # error no recuperable (ej. no se pudo abrir la DB)
 
     def __init__(self, db_path='data/osrs_ge.db', parent=None):
         super().__init__(parent)
         self.db_path = db_path
         self._detener = False
+
+    def _con_notificacion(self, nombre_legible, func):
+        """
+        Envuelve `func` (una de collect_5min/1h/6h, job_horario, etc.) para
+        que, al dispararse desde el scheduler, avise por estado_cambio qué
+        cadencia/job está corriendo en ESE momento y vuelva al texto
+        "activo" al terminar — sin esto, una vez alcanzado el régimen
+        normal la UI se queda con el mismo texto genérico para siempre, sin
+        distinguir un tick de 5m de uno de 1h o de un job_horario.
+        """
+        def _wrapped(*args, **kwargs):
+            self.estado_cambio.emit(f"Recolectando {nombre_legible}...")
+            resultado = func(*args, **kwargs)
+            if not self._detener:
+                self.estado_cambio.emit("Recolectando (activo)")
+            return resultado
+        return _wrapped
 
     def run(self):
         try:
@@ -57,14 +75,19 @@ class HiloRecolector(QThread):
         except Exception as e:
             logging.error(f"Error actualizando catálogo de ítems: {e}")
 
-        self.estado_cambio.emit("Recolectando datos iniciales...")
+        # Recolección inicial, un mensaje por cadencia (antes era un solo
+        # "Recolectando datos iniciales..." que no distinguía cuál de las
+        # tres estaba en curso).
+        self.estado_cambio.emit("Recolectando 5m inicial...")
         recolector.collect_5min(db)
+        self.estado_cambio.emit("Recolectando 1h inicial...")
         recolector.collect_1h(db)
+        self.estado_cambio.emit("Recolectando 6h inicial...")
         recolector.collect_6h(db)
 
         self.estado_cambio.emit("Rellenando huecos de datos...")
         try:
-            recolector.rellenar_huecos_al_inicio(db)
+            recolector.rellenar_huecos_al_inicio(db, on_progreso=self.progreso.emit)
         except Exception as e:
             logging.error(f"Error rellenando huecos: {e}")
 
@@ -79,13 +102,13 @@ class HiloRecolector(QThread):
         # scheduler global por default de la librería `schedule`, el mismo
         # que usa recolector.py.__main__).
         schedule.clear()
-        recolector._programar_cada_n_minutos_alineado(5, recolector.collect_5min, db)
-        schedule.every().hour.at(":00", "UTC").do(recolector.collect_1h, db)
+        recolector._programar_cada_n_minutos_alineado(5, self._con_notificacion("5m", recolector.collect_5min), db)
+        schedule.every().hour.at(":00", "UTC").do(self._con_notificacion("1h", recolector.collect_1h), db)
         for h in (0, 6, 12, 18):
-            schedule.every().day.at(f"{h:02d}:00", "UTC").do(recolector.collect_6h, db)
-        schedule.every().hour.at(":05", "UTC").do(recolector.job_horario, db)
-        schedule.every().day.at("03:00", "UTC").do(recolector.job_diario, db)
-        schedule.every().sunday.at("04:00", "UTC").do(recolector.job_semanal, db)
+            schedule.every().day.at(f"{h:02d}:00", "UTC").do(self._con_notificacion("6h", recolector.collect_6h), db)
+        schedule.every().hour.at(":05", "UTC").do(self._con_notificacion("resumen y modelos (job horario)", recolector.job_horario), db)
+        schedule.every().day.at("03:00", "UTC").do(self._con_notificacion("modelos (job diario)", recolector.job_diario), db)
+        schedule.every().sunday.at("04:00", "UTC").do(self._con_notificacion("mantenimiento semanal", recolector.job_semanal), db)
 
         self.estado_cambio.emit("Recolectando (activo)")
         while not self._detener:

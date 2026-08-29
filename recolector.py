@@ -274,13 +274,21 @@ def backfill(interval, start_ts, end_ts, db, delay=1.0):
     return n_calls, total_filas
 
 
-def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0):
+def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=None):
     """
     Como `backfill()`, pero solo pide a la API los timestamps que la tabla
     todavía no tiene — pensado para rellenar huecos de recolección
     intermitente sin volver a pedir lo que ya está guardado (INSERT OR
     IGNORE ya lo protegía de duplicar, pero re-pedir miles de timestamps
     existentes desperdicia llamadas a una API pública sin necesidad).
+
+    on_progreso (opcional): callback `f(interval, n_calls, total)` llamado
+    en cada iteración del loop — sin dependencia de Qt ni de ningún otro
+    framework, solo una función plana. Es lo que le permite a
+    escritorio/hilo_recolector.py mostrar una barra de progreso real
+    (número de descargas hechas sobre el total) en vez de un simple
+    "cargando" indeterminado; sin callback (default None) el
+    comportamiento es idéntico al de siempre.
 
     Devuelve (n_calls, total_filas, faltantes) — `faltantes` es la lista de
     timestamps que efectivamente hacía falta pedir, para que el llamador
@@ -302,14 +310,18 @@ def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0):
 
     n_calls = 0
     total_filas = 0
+    total = len(faltantes)
     for ts in faltantes:
         df = collect_func(db, timestamp=ts)
         n_calls += 1
         total_filas += len(df) if df is not None else 0
 
+        if on_progreso is not None:
+            on_progreso(interval, n_calls, total)
+
         if n_calls % 24 == 0:
             logging.info(
-                f"Backfill de faltantes {interval}: {n_calls}/{len(faltantes)} llamadas, "
+                f"Backfill de faltantes {interval}: {n_calls}/{total} llamadas, "
                 f"{total_filas} filas acumuladas"
             )
 
@@ -343,8 +355,15 @@ def _agrupar_en_rangos(timestamps, step):
     return rangos
 
 
-def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0):
+def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_progreso=None):
     """
+    on_progreso (opcional): callback `f(fase, actual, total)` — se pasa
+    tal cual a backfill_faltantes() (fase = el intervalo, ej. '1h') y a
+    replay_historico.ejecutar_replay() (fase = 'replay') para que
+    escritorio/hilo_recolector.py pueda mostrar una barra de progreso real
+    durante el relleno de huecos y el replay que puede disparar. Ver el
+    docstring de backfill_faltantes.
+
     Se corre una vez al arrancar el recolector: por cada intervalo en
     `intervalos`, mira desde cuándo hay datos en su tabla y rellena con
     `backfill_faltantes` todo lo que falte hasta ahora. Soluciona la
@@ -427,7 +446,7 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0):
         limite_legible = datetime.fromtimestamp(limite).strftime('%Y-%m-%d %H:%M:%S')
         logging.info(f"=== Relleno de huecos al iniciar: {interval} desde {inicio_legible} hasta {limite_legible} ===")
         try:
-            _, _, faltantes = backfill_faltantes(interval, inicio, limite, db, delay=delay)
+            _, _, faltantes = backfill_faltantes(interval, inicio, limite, db, delay=delay, on_progreso=on_progreso)
         except Exception as e:
             logging.error(f"Error rellenando huecos de {interval}: {e}")
             continue
@@ -439,7 +458,7 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0):
         logging.info(f"Replay histórico: {len(rangos)} rango(s) de hueco detectado(s) en precios_1h")
         for inicio_rango, fin_rango in rangos:
             try:
-                ejecutar_replay(db, inicio_rango, fin_rango)
+                ejecutar_replay(db, inicio_rango, fin_rango, on_progreso=on_progreso)
             except Exception as e:
                 logging.error(f"Error en replay histórico del rango {inicio_rango}-{fin_rango}: {e}")
 

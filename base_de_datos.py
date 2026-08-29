@@ -745,6 +745,46 @@ class OSRSBaseDatos:
         conn.close()
         return df
 
+    def obtener_resumen_datos(self):
+        """
+        Cuánto historial hay disponible AHORA MISMO en cada tabla de
+        precios — pensado para mostrarse en la app de escritorio
+        (escritorio/paginas/pagina_inicio.py) sin tener que abrir la DB a
+        mano. Incluye precios_1h_diario (el agregado que
+        mantenimiento.archivar_datos_antiguos produce al purgar
+        precios_1h) además de las 3 tablas crudas — sin esa cuarta fila,
+        la cantidad real de historial acumulado (incluido lo ya
+        archivado) quedaría subestimada.
+
+        Devuelve {tabla: {filas, desde_ts, hasta_ts, dias_historial}}.
+        desde_ts/hasta_ts/dias_historial quedan en None si la tabla está
+        vacía. COUNT/MIN/MAX son consultas rápidas acá (columna de tiempo
+        indexada en las 4 tablas), incluso sobre una DB de cientos de MB.
+        `precios_1h_diario` usa `fecha` en vez de `timestamp` como su
+        columna de tiempo (ver el esquema en __init__).
+        """
+        columna_tiempo = {
+            'precios_5m': 'timestamp',
+            'precios_1h': 'timestamp',
+            'precios_6h': 'timestamp',
+            'precios_1h_diario': 'fecha',
+        }
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        resumen = {}
+        for tabla, col in columna_tiempo.items():
+            c.execute(f'SELECT COUNT(*), MIN({col}), MAX({col}) FROM {tabla}')
+            filas, desde_ts, hasta_ts = c.fetchone()
+            dias_historial = (hasta_ts - desde_ts) / 86400 if desde_ts is not None and hasta_ts is not None else None
+            resumen[tabla] = {
+                'filas': filas,
+                'desde_ts': desde_ts,
+                'hasta_ts': hasta_ts,
+                'dias_historial': dias_historial,
+            }
+        conn.close()
+        return resumen
+
     def obtener_top_items_liquidez(self, n=200, solo_f2p=False, precio_minimo=None, excluir_item_ids=None):
         """
         Devuelve los `n` item_id más líquidos según `volumen_24h` en
