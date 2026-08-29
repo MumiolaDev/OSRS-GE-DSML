@@ -144,7 +144,18 @@ class PaginaInicio(QWidget):
             # después de %p alcanza para el signo de porcentaje. Verificado
             # a mano: %p%% rendía "(7%%)" en vez de "(7%)".
             self.barra_progreso.setFormat(f"{fase}: %v/%m (%p%)")
-        self._refrescar_datos_disponibles()
+        # NO se refresca "Datos disponibles" acá a propósito -- este
+        # handler corre en CADA descarga individual durante el backfill
+        # (potencialmente cientos de veces), y obtener_resumen_datos() hace
+        # COUNT(*) sobre precios_1h/5m, que en una DB real de millones de
+        # filas mide ~1 segundo por sí solo (medido: 4.4M filas en
+        # precios_1h). Sumado al costo ya real del propio INSERT OR IGNORE
+        # sobre una tabla de ese tamaño (documentado en CLAUDE.md) y al
+        # segundo de pausa entre pedidos a la API, este refresco de más
+        # era el único de los tres costos que no aportaba nada a cambio y
+        # sí se podía evitar sin más — se sigue refrescando en cada cambio
+        # de fase (_on_estado_cambio), que alcanza para ver el avance real
+        # sin pagar el costo en cada descarga individual.
 
     def _mostrar_error(self, mensaje):
         self.label_estado.setText(f"Error: {mensaje}")
