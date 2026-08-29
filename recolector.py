@@ -7,7 +7,7 @@ from datetime import datetime
 from osrs_ge_api import OSRSGeAPI
 from base_de_datos import OSRSBaseDatos
 from metricas import calcular_resumen_todos
-from entrenador import entrenar_modelo_global, entrenar_clasificador_direccional
+from entrenador import entrenar_desde_config
 from mantenimiento import ejecutar_mantenimiento_semanal
 
 
@@ -95,59 +95,31 @@ TABLA_POR_INTERVALO = {'5m': 'precios_5m', '1h': 'precios_1h', '6h': 'precios_6h
 
 def _entrenar_desde_config(db, cfg, guardar_en_disco=True, calcular_metricas_horizonte=False):
     """
-    Despacha el entrenamiento de un modelo según su fila de modelos_config
-    (ver base_de_datos.OSRSBaseDatos._fila_a_modelo_config) hacia
-    entrenador.entrenar_modelo_global (tipo='regresor') o
-    entrenador.entrenar_clasificador_direccional (tipo='clasificador') — es
-    lo que le permite a job_horario/job_diario reentrenar tanto los 3
-    modelos productivos sembrados en la migración como cualquier modelo que
-    el usuario defina después desde la app de escritorio, sin distinguir
-    entre unos y otros.
-
-    modo_seleccion='manual' pasa item_ids tal cual (entrenador.py entonces
-    ignora n_items/solo_f2p); 'liquidez' pasa n_items/solo_f2p — más
-    precio_minimo/excluir_item_ids, que solo el clasificador soporta hoy
-    (ver entrenar_modelo_global/entrenar_clasificador_direccional).
-
-    tabla/ventana_dias se pasan siempre tal cual estén en la config
-    (default 'precios_1h'/None si son NULL en la fila, el comportamiento
-    de siempre) — es lo que permite que un modelo de modelos_config entrene
-    sobre precios_5m/6h con una ventana acotada, no solo precios_1h con
-    todo el historial.
+    Reentrena (en vivo) un modelo de modelos_config — regresor o
+    clasificador, sobre su tabla/ventana/universo de ítems tal cual estén
+    configurados (ver entrenador._kwargs_desde_modelo_config, que interpreta
+    modo_seleccion='manual'/'liquidez') — es lo que le permite a
+    job_horario/job_diario reentrenar tanto los 3 modelos productivos
+    sembrados en la migración como cualquier modelo que el usuario defina
+    después desde la app de escritorio, sin distinguir entre unos y otros.
 
     Actualiza modelos_config.ultimo_entrenamiento_ts SOLO si el
     entrenamiento efectivamente corrió (no en un corte temprano por falta
-    de ítems/historial suficiente, ver el valor de retorno de
-    entrenar_modelo_global/entrenar_clasificador_direccional) — así la app
-    de escritorio no muestra "entrenado hace un momento" sobre un modelo
-    que en realidad nunca llegó a entrenar. No se hace dentro de un
-    try/except acá porque el llamador (job_horario/job_diario) ya envuelve
-    cada llamada a esta función en el suyo propio.
+    de ítems/historial suficiente) — así la app de escritorio no muestra
+    "entrenado hace un momento" sobre un modelo que en realidad nunca
+    llegó a entrenar. No se hace dentro de un try/except acá porque el
+    llamador (job_horario/job_diario) ya envuelve cada llamada a esta
+    función en el suyo propio.
 
     Devuelve True/False según si entrenó de verdad — lo usa
     escritorio/paginas/pagina_modelos.py para el botón "Entrenar ahora".
     """
-    kwargs = dict(
-        model_name=cfg['model_id'], guardar_en_disco=guardar_en_disco,
-        tabla=cfg.get('tabla') or 'precios_1h', ventana_dias=cfg.get('ventana_dias'),
-    )
-    if cfg['modo_seleccion'] == 'manual':
-        kwargs['item_ids'] = cfg['item_ids']
-    else:
-        kwargs['n_items'] = cfg['n_items']
-        kwargs['solo_f2p'] = cfg['solo_f2p']
+    overrides = dict(guardar_en_disco=guardar_en_disco)
+    if cfg['tipo'] != 'clasificador':
+        overrides['calcular_metricas_horizonte'] = calcular_metricas_horizonte
 
-    if cfg['tipo'] == 'clasificador':
-        if cfg['modo_seleccion'] != 'manual':
-            kwargs['precio_minimo'] = cfg['precio_minimo']
-            kwargs['excluir_item_ids'] = cfg['excluir_item_ids']
-        if cfg['umbral_pct'] is not None:
-            kwargs['umbral_pct'] = cfg['umbral_pct']
-        _, test = entrenar_clasificador_direccional(db, **kwargs)
-        exito = test is not None
-    else:
-        kwargs['calcular_metricas_horizonte'] = calcular_metricas_horizonte
-        exito = bool(entrenar_modelo_global(db, **kwargs))
+    resultado = entrenar_desde_config(db, cfg, **overrides)
+    exito = (resultado[1] is not None) if cfg['tipo'] == 'clasificador' else bool(resultado)
 
     if exito:
         db.actualizar_modelo_config(cfg['model_id'], ultimo_entrenamiento_ts=int(time.time()))

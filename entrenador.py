@@ -530,6 +530,59 @@ def entrenar_clasificador_direccional(
     return modelo, test
 
 
+def _kwargs_desde_modelo_config(cfg):
+    """
+    Traduce una fila de modelos_config (ver
+    base_de_datos.OSRSBaseDatos._fila_a_modelo_config) a los kwargs
+    comunes que entrenar_modelo_global/entrenar_clasificador_direccional
+    esperan — compartido entre recolector._entrenar_desde_config
+    (reentrenamiento en vivo, programado) y
+    replay_historico.ejecutar_replay_modelo (walk-forward inicial al crear
+    un modelo), para no tener el mismo mapeo modo_seleccion/tipo
+    duplicado en dos archivos (antes solo vivía en recolector.py).
+
+    No incluye ahora_ts/guardar_en_disco/modo_evaluacion/
+    calcular_metricas_horizonte — esos dependen de PARA QUÉ se está
+    entrenando (en vivo vs. un checkpoint del pasado), los agrega el
+    llamador vía entrenar_desde_config(db, cfg, **overrides).
+    """
+    kwargs = dict(
+        model_name=cfg['model_id'], tabla=cfg.get('tabla') or 'precios_1h',
+        ventana_dias=cfg.get('ventana_dias'),
+    )
+    if cfg['modo_seleccion'] == 'manual':
+        kwargs['item_ids'] = cfg['item_ids']
+    else:
+        kwargs['n_items'] = cfg['n_items']
+        kwargs['solo_f2p'] = cfg['solo_f2p']
+        if cfg['tipo'] == 'clasificador':
+            kwargs['precio_minimo'] = cfg['precio_minimo']
+            kwargs['excluir_item_ids'] = cfg['excluir_item_ids']
+    if cfg['tipo'] == 'clasificador' and cfg['umbral_pct'] is not None:
+        kwargs['umbral_pct'] = cfg['umbral_pct']
+    return kwargs
+
+
+def entrenar_desde_config(db, cfg, **overrides):
+    """
+    Llama entrenar_modelo_global o entrenar_clasificador_direccional según
+    cfg['tipo'], con los kwargs derivados de _kwargs_desde_modelo_config +
+    `overrides` (típicamente ahora_ts, guardar_en_disco, modo_evaluacion,
+    calcular_metricas_horizonte).
+
+    Devuelve exactamente lo que devuelve la función subyacente sin
+    envolverlo — True/False para el regresor, (modelo, test) para el
+    clasificador — el llamador decide cómo interpretar el éxito en cada
+    caso (ver recolector._entrenar_desde_config y
+    replay_historico.ejecutar_replay_modelo).
+    """
+    kwargs = _kwargs_desde_modelo_config(cfg)
+    kwargs.update(overrides)
+    if cfg['tipo'] == 'clasificador':
+        return entrenar_clasificador_direccional(db, **kwargs)
+    return entrenar_modelo_global(db, **kwargs)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s |--| %(levelname)s |--| %(message)s')
     db = OSRSBaseDatos('data/osrs_ge.db')

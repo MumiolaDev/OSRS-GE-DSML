@@ -227,3 +227,130 @@ def ejecutar_replay_clasificador(db, desde_ts, hasta_ts, n_items=10, solo_f2p=Tr
     if not resultados:
         return pd.DataFrame()
     return pd.concat(resultados, ignore_index=True)
+
+
+def _rango_disponible(db, tabla, cfg):
+    """
+    MIN/MAX timestamp disponible en `tabla` para los ítems de `cfg` — si
+    modo_seleccion='manual', acotado a esos item_ids; si 'liquidez', el
+    rango global de la tabla (no hay forma barata de saber qué ítems
+    habrían entrado en el ranking de liquidez en cada momento histórico
+    sin recorrerlo, así que se usa el rango completo como aproximación —
+    entrenar_desde_config igual va a filtrar el universo real ítem por
+    ítem en cada checkpoint vía obtener_top_items_liquidez_hasta).
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db.db_path)
+    c = conn.cursor()
+    if cfg['modo_seleccion'] == 'manual' and cfg['item_ids']:
+        placeholders = ','.join('?' * len(cfg['item_ids']))
+        c.execute(f'SELECT MIN(timestamp), MAX(timestamp) FROM {tabla} WHERE item_id IN ({placeholders})', cfg['item_ids'])
+    else:
+        c.execute(f'SELECT MIN(timestamp), MAX(timestamp) FROM {tabla}')
+    desde_ts, hasta_ts = c.fetchone()
+    conn.close()
+    return desde_ts, hasta_ts
+
+
+PASO_SEGUNDOS_POR_TABLA = {'precios_5m': 300, 'precios_1h': 3600, 'precios_6h': 21600}
+
+
+def ejecutar_replay_modelo(db, model_id, on_progreso=None, debe_detener=None):
+    """
+    Walk-forward de CUALQUIER modelo de modelos_config — a diferencia de
+    ejecutar_replay() (solo sirve para los 2 regresores productivos, con
+    checkpoints alineados al scheduler fijo de job_horario/job_diario),
+    esta función deriva todo (tabla, ventana, universo de ítems, tipo
+    regresor/clasificador) de la fila de modelos_config, y los checkpoints
+    se espacian al paso NATURAL de la tabla del modelo (cada 5m/1h/6h según
+    corresponda), no al de ningún scheduler.
+
+    Pensada para correr una vez, justo después de crear un modelo desde la
+    app de escritorio (ver escritorio/hilo_walkforward.py) — sobre lo que
+    ya haya de historial disponible para sus ítems, sin esperar a que
+    pasen semanas de recolección en vivo para tener una primera lectura de
+    walk-forward real (no solo un split holdout).
+
+    Reanudable igual que ejecutar_replay() (db.existe_checkpoint), y
+    respeta on_progreso/debe_detener con la misma semántica que el resto
+    del módulo — un walk-forward de varios meses a 1h son miles de
+    checkpoints, cada uno un fit de XGBoost; correrlo en un hilo aparte e
+    interrumpible no es opcional.
+
+    NO actualiza modelos_config.ultimo_entrenamiento_ts en cada checkpoint
+    (sería confuso mezclarlo con una corrida en vivo real, ver
+    recolector._entrenar_desde_config) — el llamador puede hacerlo una vez
+    al terminar si quiere reflejar que el modelo ya tiene una validación.
+
+    Devuelve (n_corridos, n_saltados, n_fallidos), mismo formato que
+    ejecutar_replay(); (0, 0, 0) si el modelo no existe o no hay
+    historial disponible todavía para sus ítems/tabla.
+    """
+    from entrenador import entrenar_desde_config
+
+    cfg = db.obtener_modelo_config(model_id)
+    if cfg is None:
+        logging.error(f"ejecutar_replay_modelo: no existe el modelo '{model_id}'")
+        return 0, 0, 0
+
+    tabla = cfg.get('tabla') or 'precios_1h'
+    paso = PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600)
+
+    desde_ts, hasta_ts = _rango_disponible(db, tabla, cfg)
+    if desde_ts is None:
+        logging.warning(f"[{model_id}] Sin historial disponible en {tabla} todavía, no se puede hacer walk-forward.")
+        return 0, 0, 0
+
+    # El último bucket puede no estar cerrado del lado de la API todavía
+    # (mismo criterio que recolector.rellenar_huecos_al_inicio) — se
+    # recorta un paso hacia atrás para no incluirlo como checkpoint.
+    hasta_ts -= paso
+    if hasta_ts < desde_ts:
+        logging.warning(f"[{model_id}] Historial insuficiente en {tabla} todavía para ningún checkpoint.")
+        return 0, 0, 0
+
+    checkpoints = list(range(desde_ts, hasta_ts + 1, paso))
+    logging.info(
+        f"[{model_id}] Walk-forward inicial: {len(checkpoints)} checkpoints entre {desde_ts} y {hasta_ts} ({tabla})"
+    )
+
+    n_corridos = n_saltados = n_fallidos = 0
+    for ts in checkpoints:
+        if debe_detener is not None and debe_detener():
+            logging.info(
+                f"[{model_id}] Walk-forward inicial interrumpido por pedido externo "
+                f"({n_corridos + n_saltados + n_fallidos}/{len(checkpoints)})"
+            )
+            break
+
+        if db.existe_checkpoint(model_id, ts, 'walkforward'):
+            n_saltados += 1
+        else:
+            try:
+                resultado = entrenar_desde_config(
+                    db, cfg, ahora_ts=ts, guardar_en_disco=False, modo_evaluacion='walkforward',
+                )
+                exito = (resultado[1] is not None) if cfg['tipo'] == 'clasificador' else bool(resultado)
+                if exito:
+                    n_corridos += 1
+                else:
+                    n_fallidos += 1
+            except Exception as e:
+                logging.error(f"[{model_id}] Walk-forward inicial: error en checkpoint ts={ts}: {e}")
+                n_fallidos += 1
+
+        if on_progreso is not None:
+            on_progreso('walkforward', n_corridos + n_saltados + n_fallidos, len(checkpoints))
+
+        if (n_corridos + n_saltados + n_fallidos) % 50 == 0:
+            logging.info(
+                f"[{model_id}] Walk-forward inicial en curso: {n_corridos} corridos, {n_saltados} ya existentes, "
+                f"{n_fallidos} fallidos, de {len(checkpoints)} checkpoints totales"
+            )
+
+    logging.info(
+        f"[{model_id}] Walk-forward inicial completo: {n_corridos} corridos, {n_saltados} ya existentes, "
+        f"{n_fallidos} fallidos, de {len(checkpoints)} checkpoints totales"
+    )
+    return n_corridos, n_saltados, n_fallidos
