@@ -160,7 +160,11 @@ def ejecutar_replay(db, desde_ts, hasta_ts, on_progreso=None, debe_detener=None)
     return n_corridos, n_saltados, n_fallidos
 
 
-def ejecutar_replay_clasificador(db, desde_ts, hasta_ts, n_items=10, solo_f2p=True, model_name=None, umbral_pct=None, precio_minimo=None, excluir_item_ids=None):
+def ejecutar_replay_clasificador(
+    db, desde_ts, hasta_ts, n_items=10, solo_f2p=True, model_name=None,
+    umbral_pct=None, precio_minimo=None, excluir_item_ids=None,
+    item_ids=None, tabla='precios_1h', ventana_dias=None, on_progreso=None, debe_detener=None,
+):
     """
     Como ejecutar_replay(), pero para el clasificador direccional
     (entrenador.entrenar_clasificador_direccional) en vez del regresor —
@@ -180,6 +184,20 @@ def ejecutar_replay_clasificador(db, desde_ts, hasta_ts, n_items=10, solo_f2p=Tr
     excluir_item_ids: ver entrenador.entrenar_clasificador_direccional —
     idem, aplicado en cada checkpoint.
 
+    item_ids (opcional): ver entrenador.entrenar_modelo_global — lista
+    explícita de ítems (modo manual), en vez de derivar el universo desde
+    n_items/solo_f2p/precio_minimo/excluir_item_ids en cada checkpoint.
+    tabla/ventana_dias: ver entrenador.entrenar_modelo_global — misma
+    granularidad y ventana de historial configurables. Los tres son lo que
+    le permite a esta función (antes atada a la liquidez sobre
+    precios_1h con todo el historial) usarse para un grupo de ítems
+    puntual con su propia configuración, ej. desde
+    busqueda_hiperparametros.py.
+
+    on_progreso/debe_detener: mismo patrón que replay_historico.
+    ejecutar_replay/ejecutar_replay_modelo — callback f(fase, actual,
+    total) y f() -> bool, respectivamente.
+
     Devuelve un DataFrame con todas las filas de test acumuladas (columnas
     item_id, timestamp_target, price_actual, target, clase_predicha,
     clase_real, entre otras) — insumo directo de
@@ -189,13 +207,18 @@ def ejecutar_replay_clasificador(db, desde_ts, hasta_ts, n_items=10, solo_f2p=Tr
     import pandas as pd
 
     model_name = model_name or (MODEL_NAME_CLASIF_F2P if solo_f2p else MODEL_NAME_CLASIFICADOR)
-    kwargs = {}
+    kwargs = dict(tabla=tabla, ventana_dias=ventana_dias)
+    if item_ids is not None:
+        kwargs['item_ids'] = item_ids
+    else:
+        kwargs['n_items'] = n_items
+        kwargs['solo_f2p'] = solo_f2p
+        if precio_minimo is not None:
+            kwargs['precio_minimo'] = precio_minimo
+        if excluir_item_ids is not None:
+            kwargs['excluir_item_ids'] = excluir_item_ids
     if umbral_pct is not None:
         kwargs['umbral_pct'] = umbral_pct
-    if precio_minimo is not None:
-        kwargs['precio_minimo'] = precio_minimo
-    if excluir_item_ids is not None:
-        kwargs['excluir_item_ids'] = excluir_item_ids
 
     checkpoints = [ts for ts, tipo in calcular_checkpoints(desde_ts, hasta_ts) if tipo == 'horario']
     logging.info(f"Replay clasificador [{model_name}]: {len(checkpoints)} checkpoints horarios entre {desde_ts} y {hasta_ts}")
@@ -203,10 +226,13 @@ def ejecutar_replay_clasificador(db, desde_ts, hasta_ts, n_items=10, solo_f2p=Tr
     resultados = []
     n_ok = n_vacios = n_fallidos = 0
     for ts in checkpoints:
+        if debe_detener is not None and debe_detener():
+            logging.info(f"Replay clasificador [{model_name}]: interrumpido por pedido externo ({n_ok + n_vacios + n_fallidos}/{len(checkpoints)})")
+            break
+
         try:
             _, test = entrenar_clasificador_direccional(
-                db, n_items=n_items, solo_f2p=solo_f2p, model_name=model_name,
-                ahora_ts=ts, modo_evaluacion='walkforward', **kwargs,
+                db, model_name=model_name, ahora_ts=ts, modo_evaluacion='walkforward', **kwargs,
             )
             if test is not None and not test.empty:
                 resultados.append(test)
@@ -216,6 +242,9 @@ def ejecutar_replay_clasificador(db, desde_ts, hasta_ts, n_items=10, solo_f2p=Tr
         except Exception as e:
             logging.error(f"Replay clasificador: error en checkpoint {ts}: {e}")
             n_fallidos += 1
+
+        if on_progreso is not None:
+            on_progreso('walkforward', n_ok + n_vacios + n_fallidos, len(checkpoints))
 
         if (n_ok + n_vacios + n_fallidos) % 50 == 0:
             logging.info(
@@ -256,7 +285,7 @@ def _rango_disponible(db, tabla, cfg):
 PASO_SEGUNDOS_POR_TABLA = {'precios_5m': 300, 'precios_1h': 3600, 'precios_6h': 21600}
 
 
-def ejecutar_replay_modelo(db, model_id, on_progreso=None, debe_detener=None):
+def ejecutar_replay_modelo(db, model_id, desde_ts=None, hasta_ts=None, on_progreso=None, debe_detener=None):
     """
     Walk-forward de CUALQUIER modelo de modelos_config — a diferencia de
     ejecutar_replay() (solo sirve para los 2 regresores productivos, con
@@ -265,6 +294,17 @@ def ejecutar_replay_modelo(db, model_id, on_progreso=None, debe_detener=None):
     regresor/clasificador) de la fila de modelos_config, y los checkpoints
     se espacian al paso NATURAL de la tabla del modelo (cada 5m/1h/6h según
     corresponda), no al de ningún scheduler.
+
+    desde_ts/hasta_ts (opcionales, default None = todo el historial
+    disponible para los ítems del modelo): acotan el rango de checkpoints
+    — sin esto, el walk-forward siempre recorre TODO lo que haya (el
+    comportamiento pensado para "walk-forward inicial al crear un
+    modelo", ver escritorio/hilo_walkforward.py). Pasar un rango explícito
+    es lo que le permite a busqueda_hiperparametros.py acotar cada prueba
+    a la ventana del backtest (ej. las últimas 2 semanas) en vez de
+    recorrer meses de historial de más que después ni siquiera se usan
+    para el backtest — sin esto, cada prueba de la búsqueda tardaría
+    varias veces más de lo necesario.
 
     Pensada para correr una vez, justo después de crear un modelo desde la
     app de escritorio (ver escritorio/hilo_walkforward.py) — sobre lo que
@@ -297,15 +337,21 @@ def ejecutar_replay_modelo(db, model_id, on_progreso=None, debe_detener=None):
     tabla = cfg.get('tabla') or 'precios_1h'
     paso = PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600)
 
-    desde_ts, hasta_ts = _rango_disponible(db, tabla, cfg)
-    if desde_ts is None:
+    desde_disponible, hasta_disponible = _rango_disponible(db, tabla, cfg)
+    if desde_disponible is None:
         logging.warning(f"[{model_id}] Sin historial disponible en {tabla} todavía, no se puede hacer walk-forward.")
         return 0, 0, 0
 
     # El último bucket puede no estar cerrado del lado de la API todavía
     # (mismo criterio que recolector.rellenar_huecos_al_inicio) — se
     # recorta un paso hacia atrás para no incluirlo como checkpoint.
-    hasta_ts -= paso
+    hasta_disponible -= paso
+
+    # Si el llamador pidió un rango explícito, se acota al disponible (no
+    # tiene sentido pedir checkpoints donde no hay datos para entrenar).
+    desde_ts = max(desde_ts, desde_disponible) if desde_ts is not None else desde_disponible
+    hasta_ts = min(hasta_ts, hasta_disponible) if hasta_ts is not None else hasta_disponible
+
     if hasta_ts < desde_ts:
         logging.warning(f"[{model_id}] Historial insuficiente en {tabla} todavía para ningún checkpoint.")
         return 0, 0, 0

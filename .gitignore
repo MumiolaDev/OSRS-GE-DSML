@@ -28,6 +28,10 @@ logs/
 # nunca credenciales commiteadas, ver configuracion.py
 config.json
 
+# Resultados generados por busqueda_hiperparametros.py (una corrida local,
+# no un artefacto versionable)
+resultados_busqueda.csv
+
 # Jupyter
 .ipynb_checkpoints/
 
