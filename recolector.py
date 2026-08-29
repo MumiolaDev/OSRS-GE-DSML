@@ -274,7 +274,7 @@ def backfill(interval, start_ts, end_ts, db, delay=1.0):
     return n_calls, total_filas
 
 
-def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=None):
+def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=None, debe_detener=None):
     """
     Como `backfill()`, pero solo pide a la API los timestamps que la tabla
     todavía no tiene — pensado para rellenar huecos de recolección
@@ -289,6 +289,13 @@ def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=No
     (número de descargas hechas sobre el total) en vez de un simple
     "cargando" indeterminado; sin callback (default None) el
     comportamiento es idéntico al de siempre.
+
+    debe_detener (opcional): callback `f() -> bool`, chequeado antes de
+    cada request — si devuelve True, corta el loop ahí mismo (con lo ya
+    descargado hasta ese punto) en vez de terminar todo `faltantes`. Sin
+    esto, pedir que el recolector se detenga mientras corre un backfill
+    largo no tenía ningún efecto hasta que ese backfill terminaba solo —
+    ver escritorio/hilo_recolector.py, que pasa `lambda: self._detener`.
 
     Devuelve (n_calls, total_filas, faltantes) — `faltantes` es la lista de
     timestamps que efectivamente hacía falta pedir, para que el llamador
@@ -312,6 +319,10 @@ def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=No
     total_filas = 0
     total = len(faltantes)
     for ts in faltantes:
+        if debe_detener is not None and debe_detener():
+            logging.info(f"Backfill de faltantes {interval}: interrumpido por pedido externo ({n_calls}/{total})")
+            break
+
         df = collect_func(db, timestamp=ts)
         n_calls += 1
         total_filas += len(df) if df is not None else 0
@@ -355,7 +366,7 @@ def _agrupar_en_rangos(timestamps, step):
     return rangos
 
 
-def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_progreso=None):
+def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_progreso=None, debe_detener=None):
     """
     on_progreso (opcional): callback `f(fase, actual, total)` — se pasa
     tal cual a backfill_faltantes() (fase = el intervalo, ej. '1h') y a
@@ -363,6 +374,11 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
     escritorio/hilo_recolector.py pueda mostrar una barra de progreso real
     durante el relleno de huecos y el replay que puede disparar. Ver el
     docstring de backfill_faltantes.
+
+    debe_detener (opcional): callback `f() -> bool`, se pasa tal cual a
+    backfill_faltantes()/ejecutar_replay() (corta cada uno a mitad de
+    camino) y además se chequea entre intervalos y entre rangos de replay,
+    para no arrancar un tramo nuevo si ya se pidió parar.
 
     Se corre una vez al arrancar el recolector: por cada intervalo en
     `intervalos`, mira desde cuándo hay datos en su tabla y rellena con
@@ -414,6 +430,10 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
     ahora = int(time.time())
 
     for interval in intervalos:
+        if debe_detener is not None and debe_detener():
+            logging.info("rellenar_huecos_al_inicio: interrumpido por pedido externo")
+            break
+
         tabla = TABLA_POR_INTERVALO[interval]
         _, step = INTERVALS[interval]
         ahora_alineado = ahora - (ahora % step)
@@ -446,7 +466,9 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
         limite_legible = datetime.fromtimestamp(limite).strftime('%Y-%m-%d %H:%M:%S')
         logging.info(f"=== Relleno de huecos al iniciar: {interval} desde {inicio_legible} hasta {limite_legible} ===")
         try:
-            _, _, faltantes = backfill_faltantes(interval, inicio, limite, db, delay=delay, on_progreso=on_progreso)
+            _, _, faltantes = backfill_faltantes(
+                interval, inicio, limite, db, delay=delay, on_progreso=on_progreso, debe_detener=debe_detener,
+            )
         except Exception as e:
             logging.error(f"Error rellenando huecos de {interval}: {e}")
             continue
@@ -457,8 +479,11 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
         rangos = _agrupar_en_rangos(faltantes, step)
         logging.info(f"Replay histórico: {len(rangos)} rango(s) de hueco detectado(s) en precios_1h")
         for inicio_rango, fin_rango in rangos:
+            if debe_detener is not None and debe_detener():
+                logging.info("rellenar_huecos_al_inicio: replay interrumpido por pedido externo")
+                break
             try:
-                ejecutar_replay(db, inicio_rango, fin_rango, on_progreso=on_progreso)
+                ejecutar_replay(db, inicio_rango, fin_rango, on_progreso=on_progreso, debe_detener=debe_detener)
             except Exception as e:
                 logging.error(f"Error en replay histórico del rango {inicio_rango}-{fin_rango}: {e}")
 

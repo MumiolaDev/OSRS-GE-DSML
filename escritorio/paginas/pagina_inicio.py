@@ -60,6 +60,11 @@ class PaginaInicio(QWidget):
 
         fila_estado = QHBoxLayout()
         self.label_estado = QLabel("Recolector detenido")
+        # setWordWrap(True): un mensaje de error largo (ej. una excepción
+        # completa vía _mostrar_error) no debe forzar el ancho mínimo de
+        # toda la ventana -- ver el mismo problema real ya encontrado y
+        # corregido en pagina_configuracion.py.
+        self.label_estado.setWordWrap(True)
         self.boton_toggle = QPushButton("Iniciar recolector")
         self.boton_toggle.clicked.connect(self._alternar_recolector)
         fila_estado.addWidget(self.label_estado, stretch=1)

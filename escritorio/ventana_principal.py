@@ -38,7 +38,7 @@ class VentanaPrincipal(QMainWindow):
     def __init__(self, db_path=DB_PATH):
         super().__init__()
         self.setWindowTitle("OSRS GE Predictor")
-        self.resize(800, 600)
+        self.resize(600, 800)
 
         self.db = self._abrir_db_con_fallback(db_path)
         db_path_efectivo = self.db.db_path

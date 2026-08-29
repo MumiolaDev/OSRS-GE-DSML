@@ -17,12 +17,21 @@ class PaginaConfiguracion(QWidget):
 
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel(
+        # setWordWrap(True): sin esto, un QLabel de una sola línea larga
+        # como este fuerza su minimumSizeHint al ancho completo del texto
+        # sin cortar -- eso se propaga hacia arriba (QTabWidget ->
+        # QMainWindow) y termina fijando un ancho mínimo enorme para TODA
+        # la ventana, impidiendo achicarla a mano aunque las demás tabs
+        # sean angostas (encontrado con la ventana pidiendo 1420px de
+        # ancho mínimo solo por este label).
+        aviso = QLabel(
             "El token y el chat id de Telegram se guardan en config.json (nunca se commitean). "
             "Si además hay variables de entorno TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID seteadas en "
             "el sistema (ej. un despliegue como servicio), esas tienen prioridad sobre lo que "
             "esté acá."
-        ))
+        )
+        aviso.setWordWrap(True)
+        layout.addWidget(aviso)
 
         form = QFormLayout()
         self.campo_token = QLineEdit()

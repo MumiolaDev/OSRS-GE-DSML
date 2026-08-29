@@ -182,6 +182,7 @@ class PaginaModelos(QWidget):
         layout.addLayout(fila_botones)
 
         self.label_estado = QLabel("")
+        self.label_estado.setWordWrap(True)  # ver pagina_configuracion.py: un mensaje largo no debe fijar el ancho mínimo de la ventana
         layout.addWidget(self.label_estado)
 
         self.tabla, self.modelo_tabla = crear_tabla(columnas=COLUMNAS_TABLA)

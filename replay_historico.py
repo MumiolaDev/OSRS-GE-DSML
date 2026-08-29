@@ -70,7 +70,7 @@ def calcular_checkpoints(desde_ts, hasta_ts, minuto_offset_horario=MINUTO_OFFSET
     return checkpoints
 
 
-def ejecutar_replay(db, desde_ts, hasta_ts, on_progreso=None):
+def ejecutar_replay(db, desde_ts, hasta_ts, on_progreso=None, debe_detener=None):
     """
     on_progreso (opcional): callback `f(fase, actual, total)`, llamado con
     fase='replay' en cada checkpoint procesado (corrido, saltado o
@@ -79,6 +79,12 @@ def ejecutar_replay(db, desde_ts, hasta_ts, on_progreso=None):
     escritorio/hilo_recolector.py mostrar progreso real durante un replay
     largo en vez de dejar la UI sin ninguna señal por potencialmente
     minutos u horas.
+
+    debe_detener (opcional): callback `f() -> bool`, chequeado antes de
+    cada checkpoint — si devuelve True, corta el loop ahí mismo (un
+    replay largo, de potencialmente miles de checkpoints, no debía tener
+    forma de interrumpirse antes de esto: pedir "detener" desde la app de
+    escritorio no tenía ningún efecto hasta que terminaba solo).
 
     Recorre calcular_checkpoints(desde_ts, hasta_ts) en orden cronológico y,
     para cada uno que no haya corrido todavía (db.existe_checkpoint), llama
@@ -103,6 +109,13 @@ def ejecutar_replay(db, desde_ts, hasta_ts, on_progreso=None):
 
     n_corridos = n_saltados = n_fallidos = 0
     for ts, tipo in checkpoints:
+        if debe_detener is not None and debe_detener():
+            logging.info(
+                f"Replay histórico: interrumpido por pedido externo "
+                f"({n_corridos + n_saltados + n_fallidos}/{len(checkpoints)})"
+            )
+            break
+
         model_name = MODEL_NAME_HORARIO if tipo == 'horario' else MODEL_NAME_DIARIO
 
         if db.existe_checkpoint(model_name, ts, 'walkforward'):

@@ -85,16 +85,41 @@ class HiloRecolector(QThread):
         self.estado_cambio.emit("Recolectando 6h inicial...")
         recolector.collect_6h(db)
 
+        if self._detener:
+            self.estado_cambio.emit("Detenido")
+            return
+
         self.estado_cambio.emit("Rellenando huecos de datos...")
         try:
-            recolector.rellenar_huecos_al_inicio(db, on_progreso=self.progreso.emit)
+            recolector.rellenar_huecos_al_inicio(
+                db, on_progreso=self.progreso.emit, debe_detener=lambda: self._detener,
+            )
         except Exception as e:
             logging.error(f"Error rellenando huecos: {e}")
 
+        # Chequear _detener entre cada fase del arranque (además de dentro
+        # de rellenar_huecos_al_inicio/backfill_faltantes/ejecutar_replay,
+        # que ahora sí lo respetan a mitad de su propio loop) -- sin esto,
+        # pedir "Detener" durante el backfill lo cortaba ahí pero la app
+        # igual seguía con el catch-up semanal y el reentrenamiento de
+        # job_horario antes de terminar, con la misma sensación de "no
+        # respeta el botón".
+        if self._detener:
+            self.estado_cambio.emit("Detenido")
+            return
+
         recolector.verificar_catchup_semanal(db)
+
+        if self._detener:
+            self.estado_cambio.emit("Detenido")
+            return
 
         self.estado_cambio.emit("Actualizando resumen y modelos...")
         recolector.job_horario(db)
+
+        if self._detener:
+            self.estado_cambio.emit("Detenido")
+            return
 
         # schedule.clear() antes de registrar: defensivo ante un
         # arranque/parada/reinicio dentro del mismo proceso (la app crea un
