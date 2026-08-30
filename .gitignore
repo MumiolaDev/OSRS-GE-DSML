@@ -28,9 +28,11 @@ logs/
 # nunca credenciales commiteadas, ver configuracion.py
 config.json
 
-# Resultados generados por busqueda_hiperparametros.py (una corrida local,
-# no un artefacto versionable)
+# Resultados generados por busqueda_hiperparametros.py / busqueda_ensemble.py
+# (corridas locales, no artefactos versionables)
 resultados_busqueda.csv
+resultados_ensemble.csv
+calidad_ensemble.csv
 
 # Jupyter
 .ipynb_checkpoints/
