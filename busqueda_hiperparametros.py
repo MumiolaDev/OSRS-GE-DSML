@@ -167,7 +167,7 @@ def _senales_clasificador(test_df):
     return candidatos[['item_id', 'ts_entrada', 'ts_salida', 'magnitud']]
 
 
-def backtest_capital_constante(db, tabla, senales, capital_inicial, fraccion_participacion=FRACCION_PARTICIPACION):
+def backtest_capital_constante(db, tabla, senales, capital_inicial, fraccion_participacion=FRACCION_PARTICIPACION, fraccion_fn=None):
     """
     Simula, con capital REAL y limitado (no capital fantasma: una compra
     que no se puede pagar con lo disponible en ese momento no se ejecuta),
@@ -183,6 +183,18 @@ def backtest_capital_constante(db, tabla, senales, capital_inicial, fraccion_par
     Nunca hay más de PASO_SEGUNDOS de superposición (horizonte fijo a 1
     paso), así que el orden cierre-antes-que-apertura en el mismo tick ya
     alcanza para no necesitar un libro de órdenes más complejo.
+
+    fraccion_fn (opcional): callable(magnitud) -> fracción del volumen de
+    mercado a arriesgar en ESA señal, en vez de la constante
+    `fraccion_participacion` fija para todas las señales por igual. Pensado
+    para dimensionar por confianza: si `magnitud` es la probabilidad
+    softmax de 'sube' (ver entrenador.entrenar_clasificador_direccional,
+    columna prob_sube) en vez de un magnitud de retorno, una señal con 0.9
+    de confianza puede arriesgar más que una con 0.35 — la idea de
+    "meta-labeling" (Lopez de Prado, Advances in Financial Machine
+    Learning): el modelo primario decide sube/baja, un segundo score de
+    confianza decide CUÁNTO apostar. Default None mantiene el
+    comportamiento de siempre (misma fracción fija para toda señal).
 
     Devuelve (trades_df, resumen) — resumen incluye capital_final,
     ganancia, ganancia_pct, n_trades, win_rate.
@@ -240,7 +252,8 @@ def backtest_capital_constante(db, tabla, senales, capital_inicial, fraccion_par
                 volumen_cache[clave_vol] = _volumen_1h_promedio(db, tabla, item_id, t)
             volumen_1h_promedio = volumen_cache[clave_vol]
 
-            tope_mercado = min(buy_limit, volumen_1h_promedio * FRACCION_PARTICIPACION)
+            fraccion_efectiva = fraccion_fn(señal['magnitud']) if fraccion_fn is not None else fraccion_participacion
+            tope_mercado = min(buy_limit, volumen_1h_promedio * fraccion_efectiva)
             tope_capital = capital // precio_compra
             unidades = int(min(tope_mercado, tope_capital))
             if unidades < 1:

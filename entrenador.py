@@ -433,10 +433,12 @@ def entrenar_clasificador_direccional(
     si hiciera falta, aunque hoy no está enganchado al loop de replay.
 
     Devuelve (modelo, test) — `test` es el DataFrame del test set (NUNCA
-    visto en entrenamiento) con una columna 'clase_predicha' agregada,
-    listo para que backtest.py simule trades sobre datos genuinamente
-    held-out sin tener que reentrenar ni volver a correr el split. None si
-    no se pudo entrenar.
+    visto en entrenamiento) con columnas 'clase_predicha' y 'prob_sube'
+    (probabilidad softmax de la clase 'sube', para dimensionamiento por
+    confianza — ver busqueda_calibrada.py) agregadas, listo para que
+    backtest.py simule trades sobre datos genuinamente held-out sin tener
+    que reentrenar ni volver a correr el split. None si no se pudo
+    entrenar.
     """
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
 
@@ -486,8 +488,17 @@ def entrenar_clasificador_direccional(
     )
     modelo.fit(train[feature_cols], y_train_clase)
     y_pred_clase = modelo.predict(test[feature_cols])
+    proba = modelo.predict_proba(test[feature_cols])
     test['clase_predicha'] = y_pred_clase  # 0=baja, 1=estable, 2=sube — para backtest.py
     test['clase_real'] = y_test_clase  # idem, para poder medir accuracy sin recalcular después
+    # Probabilidad de la clase 'sube' (softmax, no solo el argmax) — a
+    # diferencia de clase_predicha (sí/no), esto es una medida continua de
+    # confianza que un backtest puede usar para dimensionar la posición
+    # (más confianza -> más plata en esa señal) en vez de apostar el mismo
+    # monto fijo a toda señal 'sube', sea 0.34 o 0.95 de probabilidad. No
+    # cambia ningún consumidor existente (columna nueva, se ignora si no se
+    # usa) — ver busqueda_calibrada.py para el primer uso real.
+    test['prob_sube'] = proba[:, 2]
 
     accuracy_multiclase = float((y_pred_clase == y_test_clase).mean())
     # Direccional "pura": solo entre los casos donde ni la clase real ni la
