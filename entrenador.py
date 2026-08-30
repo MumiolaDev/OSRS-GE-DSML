@@ -74,6 +74,8 @@ def entrenar_modelo_global(
     modo_evaluacion='holdout',
     calcular_metricas_horizonte=False,
     solo_f2p=False,
+    precio_minimo=None,
+    excluir_item_ids=None,
     item_ids=None,
     tabla='precios_1h',
     ventana_dias=None,
@@ -85,12 +87,20 @@ def entrenar_modelo_global(
 
     item_ids (opcional): lista explícita de ítems a usar en vez de derivar
     el universo desde obtener_top_items_liquidez[_hasta] con n_items/
-    solo_f2p — es lo que permite que un modelo definido por el usuario
-    (base_de_datos.modelos_config con modo_seleccion='manual', ver
-    recolector._entrenar_desde_config) entrene sobre exactamente los ítems
-    que eligió a mano, no sobre un ranking de liquidez. Cuando se pasa,
-    n_items/solo_f2p se ignoran por completo — el default (None) mantiene
-    el comportamiento de siempre.
+    solo_f2p/precio_minimo/excluir_item_ids — es lo que permite que un
+    modelo definido por el usuario (base_de_datos.modelos_config con
+    modo_seleccion='manual', ver recolector._entrenar_desde_config) entrene
+    sobre exactamente los ítems que eligió a mano, no sobre un ranking de
+    liquidez. Cuando se pasa, el resto de los filtros de selección se
+    ignoran por completo — el default (None) mantiene el comportamiento de
+    siempre.
+
+    precio_minimo/excluir_item_ids: ver
+    entrenar_clasificador_direccional/obtener_top_items_liquidez — mismos
+    filtros de selección por liquidez, ahora también disponibles acá (antes
+    solo existían en el clasificador; un modelo modo_seleccion='liquidez'
+    con estos filtros configurados los ignoraba silenciosamente si era de
+    tipo 'regresor', ver _kwargs_desde_modelo_config más abajo).
 
     tabla ('precios_5m'|'precios_1h'|'precios_6h', default 'precios_1h' —
     el comportamiento de siempre): granularidad de precios sobre la que se
@@ -159,9 +169,9 @@ def entrenar_modelo_global(
         logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
     else:
         if ahora_ts is None:
-            item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p)
+            item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
         else:
-            item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p)
+            item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
         logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
     if not item_ids:
         logging.error(
@@ -555,9 +565,15 @@ def _kwargs_desde_modelo_config(cfg):
     else:
         kwargs['n_items'] = cfg['n_items']
         kwargs['solo_f2p'] = cfg['solo_f2p']
-        if cfg['tipo'] == 'clasificador':
-            kwargs['precio_minimo'] = cfg['precio_minimo']
-            kwargs['excluir_item_ids'] = cfg['excluir_item_ids']
+        # precio_minimo/excluir_item_ids ahora los soportan tanto el
+        # regresor como el clasificador (ver entrenar_modelo_global) — antes
+        # esto solo se pasaba para 'clasificador' y un modelo 'regresor' en
+        # modo liquidez con estos filtros configurados los ignoraba sin
+        # avisar (bug encontrado en la primera campaña de
+        # busqueda_hiperparametros.py: 3 filas entrenaron sobre runas/
+        # Feather pese a precio_minimo=100).
+        kwargs['precio_minimo'] = cfg['precio_minimo']
+        kwargs['excluir_item_ids'] = cfg['excluir_item_ids']
     if cfg['tipo'] == 'clasificador' and cfg['umbral_pct'] is not None:
         kwargs['umbral_pct'] = cfg['umbral_pct']
     return kwargs
