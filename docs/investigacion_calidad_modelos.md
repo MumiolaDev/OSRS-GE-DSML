@@ -117,6 +117,28 @@ ya coincidía con la primera barrera cruzada). Esto sugiere que **la regla de sa
 como el modelo de entrada**, al menos para ítems donde el movimiento se desarrolla en más de un
 período.
 
+## Las tres mejoras combinadas (`busqueda_combinada.py`)
+
+Dimensionamiento por confianza y salida por triple barrera se probaron cada uno POR SEPARADO
+contra el comportamiento de siempre. Quedaba la pregunta obvia: ¿se combinan o se pisan entre sí?
+Se probaron las dos juntas (más el umbral calibrado, ya presente en ambas) sobre los dos ítems
+donde alguna mejora individual había dado resultado — reentrenando el clasificador walk-forward
+una vez más por ítem, con el mismo umbral calibrado ya encontrado, para tener `prob_sube` en
+memoria (no se persiste en la DB entre corridas).
+
+| ítem | siempre (fijo/fijo) | solo confianza | solo triple barrera | **las dos combinadas** |
+|---|---|---|---|---|
+| Kwuarm | −310.436 gp (−3,10%) | −306.846 gp (−3,07%) | −125.710 gp (−1,26%) | **−101.564 gp (−1,02%)** |
+| Bolt of canvas | +424.219 gp (+4,24%) | +461.699 gp (+4,62%) | +429.653 gp (+4,30%) | **+466.981 gp (+4,67%)** |
+
+**Resultado limpio: se combinan, no se pisan.** En los dos ítems, la variante con las dos mejoras
+juntas superó a cada una por separado y al comportamiento de siempre — en Kwuarm, la pérdida bajó
+otro 19% más allá de lo que ya lograba la triple barrera sola; en Bolt of canvas, la ganancia
+subió otro 1,2% más allá de lo que lograba cada mejora individual. No hay evidencia de que una
+mejora cancele o interfiera con la otra en esta muestra (2 ítems) — dimensionar por confianza y
+elegir cuándo salir son decisiones independientes entre sí (una es "cuánto", la otra es "cuándo"),
+así que tiene sentido que sumen en vez de competir.
+
 ## ⚠️ Advertencia importante: Basalt y la volatilidad "de eventos raros"
 
 Basalt dio +112% de ganancia en 2 semanas — una cifra que, en vez de reportarse como un hallazgo
@@ -194,7 +216,8 @@ moderada, no con la misma confianza que los 6 ítems "limpios".
    ítems, ahora que la mecánica de calibración/dimensionamiento/salida ya está validada y es
    barata de correr (no requiere reentrenar para probar dimensionamiento o salida, solo para el
    umbral calibrado en sí).
-5. **Combinar los tres hallazgos a la vez** (umbral calibrado + dimensionamiento por confianza +
-   triple barrera, todos juntos sobre el mismo ítem) no se llegó a probar esta noche — cada uno se
-   validó por separado contra la salida/dimensionamiento de siempre. Es el siguiente experimento
-   natural.
+5. ~~Combinar los tres hallazgos a la vez~~ — **hecho** (`busqueda_combinada.py`, ver sección
+   arriba): en Kwuarm y Bolt of canvas, dimensionamiento por confianza + triple barrera juntos
+   superaron a cada mejora por separado y al comportamiento de siempre — se combinan sin pisarse.
+   Sigue pendiente extenderlo a los 8 ítems completos (acá solo se probó en los 2 donde ya había
+   señal de que alguna mejora individual servía).
