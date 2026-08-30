@@ -34,6 +34,7 @@ resultados_busqueda.csv
 resultados_ensemble.csv
 calidad_ensemble.csv
 resultados_calibrada.csv
+resultados_combinada.csv
 
 # Jupyter
 .ipynb_checkpoints/
