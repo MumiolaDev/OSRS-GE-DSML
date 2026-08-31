@@ -29,12 +29,18 @@ logs/
 config.json
 
 # Resultados generados por busqueda_hiperparametros.py / busqueda_ensemble.py /
-# busqueda_calibrada.py (corridas locales, no artefactos versionables)
+# busqueda_calibrada.py / busqueda_significancia.py (corridas locales, no
+# artefactos versionables)
 resultados_busqueda.csv
 resultados_ensemble.csv
 calidad_ensemble.csv
 resultados_calibrada.csv
 resultados_combinada.csv
+resultados_significancia_predicciones.csv
+resultados_significancia_progreso.csv
+resultados_significancia_resumen.csv
+resultados_significancia_nulos.csv
+resultados_significancia_trades.csv
 
 # Jupyter
 .ipynb_checkpoints/
