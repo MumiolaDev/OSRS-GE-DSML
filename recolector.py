@@ -99,9 +99,11 @@ def _entrenar_desde_config(db, cfg, guardar_en_disco=True, calcular_metricas_hor
     clasificador, sobre su tabla/ventana/universo de ítems tal cual estén
     configurados (ver entrenador._kwargs_desde_modelo_config, que interpreta
     modo_seleccion='manual'/'liquidez') — es lo que le permite a
-    job_horario/job_diario reentrenar tanto los 3 modelos productivos
-    sembrados en la migración como cualquier modelo que el usuario defina
-    después desde la app de escritorio, sin distinguir entre unos y otros.
+    job_horario/job_diario reentrenar cualquier modelo que el usuario
+    defina desde la app de escritorio, sin ningún caso especial: no hay
+    ningún modelo sembrado por default (modelos_config arranca vacía), así
+    que si el usuario no creó ninguno todavía, job_horario/job_diario
+    simplemente no tienen nada que reentrenar esa corrida.
 
     Actualiza modelos_config.ultimo_entrenamiento_ts SOLO si el
     entrenamiento efectivamente corrió (no en un corte temprano por falta
@@ -131,16 +133,12 @@ def job_horario(db):
     Corre cada hora (:05, unos minutos después de collect_1h para no competir
     por I/O/CPU con la recolección): refresca resumen_actual y reentrena
     todos los modelos de modelos_config con cadencia='horaria' y
-    estado='activo' (ver base_de_datos.py y _entrenar_desde_config) — antes
-    eran 2 llamadas hardcodeadas ('global_horario' y 'f2p10_100gp_clasif',
-    la variante productiva del clasificador direccional: 10 ítems F2P más
-    líquidos con precio_minimo=100 y Steel bar excluido, item_id 2353 — la
-    configuración que en el backtest walk-forward de 90 días convirtió una
-    estrategia perdedora, comprar a ciegas, -67.6M gp, en ganadora, +7.3M
-    gp), ahora conviven en la misma tabla con cualquier modelo que el
-    usuario defina desde la app de escritorio con esa misma cadencia. Si el
-    refresh del resumen falla, se salta el reentrenamiento entero:
-    obtener_top_items_liquidez() (la usan los modelos con
+    estado='activo' (ver base_de_datos.py y _entrenar_desde_config) — todos
+    definidos por el usuario desde la app de escritorio, ninguno sembrado
+    por default (ver base_de_datos._migrar_esquema): sin modelos creados
+    todavía, este loop simplemente no tiene nada que reentrenar, no es un
+    error. Si el refresh del resumen falla, se salta el reentrenamiento
+    entero: obtener_top_items_liquidez() (la usan los modelos con
     modo_seleccion='liquidez') depende de que resumen_actual esté fresca.
     Cada modelo se reentrena en su propio try/except, para que un fallo en
     uno no tumbe a los demás ni a las alertas.
@@ -171,8 +169,9 @@ def job_horario(db):
 def job_diario(db):
     """
     Corre una vez al día a las 03:00: reentrena todos los modelos de
-    modelos_config con cadencia='diaria' y estado='activo' (antes,
-    solo 'global_diario' hardcodeado) y calcula métricas de horizonte
+    modelos_config con cadencia='diaria' y estado='activo' (ninguno
+    sembrado por default, todos definidos por el usuario) y calcula
+    métricas de horizonte
     (2..6 pasos, evaluacion.py) para los de tipo='regresor' — el
     clasificador no tiene esa noción, ver entrenador.py — que son caras y
     por eso no se calculan en cada corrida horaria. Reusa resumen_actual,

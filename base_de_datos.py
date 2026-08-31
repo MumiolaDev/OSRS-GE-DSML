@@ -280,11 +280,12 @@ class OSRSBaseDatos:
         #
         # modo_seleccion distingue cómo se arma el universo de ítems:
         # 'manual' (item_ids: JSON con la lista elegida a mano por el usuario
-        # en el selector de la app — el caso nuevo que motiva esta tabla) o
-        # 'liquidez' (n_items/solo_f2p/precio_minimo/excluir_item_ids: los
-        # mismos parámetros que ya acepta obtener_top_items_liquidez[_hasta]
-        # — el modo en el que se siembran los 3 modelos productivos
-        # preexistentes, sin cambiarles el comportamiento).
+        # en el selector de la app) o 'liquidez' (n_items/solo_f2p/
+        # precio_minimo/excluir_item_ids: los mismos parámetros que ya
+        # acepta obtener_top_items_liquidez[_hasta] — no expuesto desde la
+        # app de escritorio hoy, ver escritorio/paginas/pagina_modelos.py,
+        # pero sigue siendo un modo válido para crear un modelo a mano vía
+        # crear_modelo_config).
         #
         # cadencia ('horaria'|'diaria'|'manual') decide en qué job del
         # recolector se reentrena solo (o nunca, en 'manual' — para que
@@ -328,58 +329,17 @@ class OSRSBaseDatos:
 
         conn.commit()
 
-        self._sembrar_modelos_productivos(conn)
-
-    def _sembrar_modelos_productivos(self, conn):
-        """
-        Siembra en modelos_config los 3 modelos que hasta ahora vivían
-        hardcodeados en recolector.job_horario/job_diario (global_horario,
-        global_diario, f2p10_100gp_clasif) — así job_horario/job_diario
-        pueden pasar a iterar modelos_config sin perder ni cambiar el
-        comportamiento de los modelos productivos existentes al actualizar
-        una DB que ya tenía datos. INSERT OR IGNORE sobre la PK (model_id):
-        no pisa cambios que el usuario haya hecho después (ej. pausar uno)
-        si esto corre de nuevo en cada arranque.
-
-        Los parámetros de selección de ítems (n_items/solo_f2p/
-        precio_minimo/excluir_item_ids) son exactamente los que ya usaba
-        recolector.job_horario antes de esta tabla — ver su código en la
-        rama previa a app-escritorio-v1, o entrenador.py. excluir_item_ids
-        de f2p10_100gp_clasif es [2353, 449, 453] (Steel bar, Adamantite
-        ore, Coal) — ver el comentario junto a MODEL_NAME_CLASIF_F2P_100GP
-        en entrenador.py para el porqué de cada uno.
-        """
-        import json
-
-        c = conn.cursor()
-        ahora = int(time.time())
-        filas = [
-            (
-                'global_horario', 'Global horario (200 ítems líquidos)', 'regresor', 'liquidez',
-                None, 200, 0, None, None, 5, '[3, 6]', 1, None, 'horaria', 'activo', ahora, None,
-                'precios_1h', None,
-            ),
-            (
-                'global_diario', 'Global diario (200 ítems líquidos)', 'regresor', 'liquidez',
-                None, 200, 0, None, None, 5, '[3, 6]', 1, None, 'diaria', 'activo', ahora, None,
-                'precios_1h', None,
-            ),
-            (
-                'f2p10_100gp_clasif', 'Clasificador F2P (10 ítems, ≥100gp)', 'clasificador', 'liquidez',
-                None, 10, 1, 100, json.dumps([2353, 449, 453]), 5, '[3, 6]', 1, 0.5, 'horaria', 'activo', ahora, None,
-                'precios_1h', None,
-            ),
-        ]
-        c.executemany(
-            '''INSERT OR IGNORE INTO modelos_config (
-                model_id, nombre, tipo, modo_seleccion, item_ids, n_items, solo_f2p,
-                precio_minimo, excluir_item_ids, lags, ma_windows, horizonte_horas,
-                umbral_pct, cadencia, estado, creado_en, ultimo_entrenamiento_ts,
-                tabla, ventana_dias
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-            filas,
-        )
-        conn.commit()
+        # No se siembra ningún modelo por default acá (a propósito, pedido
+        # explícito del usuario: "no quiero que haya ningún modelo por
+        # default. todos tienen que poder eliminarse"). Versiones previas
+        # de este método sembraban 3 modelos productivos hardcodeados
+        # (global_horario/global_diario/f2p10_100gp_clasif) que
+        # job_horario/job_diario reentrenaban automáticamente y que la app
+        # de escritorio no dejaba eliminar (ver el historial de
+        # escritorio/paginas/pagina_modelos.py) — modelos_config arranca
+        # vacía ahora, y job_horario/job_diario (recolector.py) simplemente
+        # no reentrenan nada hasta que el usuario cree uno desde "Mis
+        # modelos" en la app.
 
     @staticmethod
     def _fila_a_modelo_config(fila):

@@ -2,8 +2,10 @@
 paginas/pagina_modelos.py — alta/gestión de modelos definidos por el
 usuario (base_de_datos.modelos_config, ver workstream 1/2 del plan). Es la
 pieza central de "libertad de elegir los ítems y ventanas deseadas" del
-plan: acá es donde el usuario arma un modelo propio, no solo mira los
-productivos.
+plan: acá es donde el usuario arma sus propios modelos. No hay ningún
+modelo sembrado por default (ver base_de_datos._migrar_esquema) ni
+protegido contra borrado — todo lo que aparece en la tabla lo creó el
+usuario, y todo se puede eliminar desde acá.
 
 Deliberadamente simple (ver la corrección del usuario sobre no repetir la
 sobrecarga de información del dashboard actual): sin selector de modo de
@@ -12,16 +14,14 @@ modelo se resume en una frase corta (_resumen_calidad), y los parámetros
 técnicos (lags, medias móviles, umbral del clasificador) no se exponen en
 el formulario de alta, quedan en los defaults sensatos de entrenador.py.
 
-Revertido a un flujo único y más simple (pedido explícito del usuario tras
-la ronda de validación de calidad de modelos — ver
-docs/investigacion_calidad_modelos.md): "+ Nuevo modelo" crea SIEMPRE un
-par (un regresor + un clasificador) sobre los mismos ítems, cadencia
-horaria, tabla precios_1h — la única granularidad que se validó con rigor.
-Antes existía también "+ Nuevo grupo" (regresor+clasificador × 3
-granularidades, 6 modelos) y un selector de tipo/cadencia en el alta
-simple; se sacaron de la UI. Lo único configurable ahora es la ventana de
-historial y los ítems — el resto queda fijo en `_crear_par_modelos`, no
-porque base_de_datos.crear_modelo_config/entrenador.py hayan perdido esa
+Revertido a un flujo único y más simple (pedido explícito del usuario):
+"+ Nuevo modelo" crea SIEMPRE un par (un regresor + un clasificador) sobre
+los mismos ítems, cadencia horaria, tabla precios_1h. Antes existía
+también "+ Nuevo grupo" (regresor+clasificador × 3 granularidades, 6
+modelos) y un selector de tipo/cadencia en el alta simple; se sacaron de
+la UI. Lo único configurable ahora es la ventana de historial y los
+ítems — el resto queda fijo en `_crear_par_modelos`, no porque
+base_de_datos.crear_modelo_config/entrenador.py hayan perdido esa
 flexibilidad (siguen aceptando tipo/cadencia/tabla arbitrarios, nada de
 eso se tocó), sino porque esta pantalla ya no la expone.
 """
@@ -37,7 +37,6 @@ from PySide6.QtWidgets import (
 )
 
 from base_de_datos import MAX_ITEMS_POR_MODELO
-from entrenador import MODEL_NAME_HORARIO, MODEL_NAME_DIARIO, MODEL_NAME_CLASIF_F2P_100GP
 from escritorio.hilo_entrenamiento import HiloEntrenamiento
 from escritorio.hilo_walkforward import HiloWalkForward
 from escritorio.widgets.selector_items import SelectorItems
@@ -45,19 +44,17 @@ from escritorio.widgets.tabla_dataframe import crear_tabla
 
 # Fijo para todo modelo creado desde acá -- ver el docstring del módulo.
 # 90d en 1h coincide con la retención real de precios_1h (ver
-# mantenimiento.RETENCION_DIAS) y con la ventana validada en la ronda de
-# significancia estadística (docs/investigacion_calidad_modelos.md), no es
-# un número arbitrario.
+# mantenimiento.RETENCION_DIAS), no es un número arbitrario.
 TABLA_FIJA = 'precios_1h'
 CADENCIA_FIJA = 'horaria'
 VENTANA_DIAS_DEFAULT = 90.0
 
-# Los 3 modelos productivos del proyecto (sembrados en la migración, ver
-# base_de_datos._sembrar_modelos_productivos) no se pueden eliminar desde
-# acá -- pausarlos alcanza para dejar de reentrenarlos, y borrarlos
-# rompería recolector.job_horario/job_diario o las alertas si alguien lo
-# hace por error.
-MODELOS_PROTEGIDOS = {MODEL_NAME_HORARIO, MODEL_NAME_DIARIO, MODEL_NAME_CLASIF_F2P_100GP}
+# No hay ningún modelo protegido/no-eliminable (pedido explícito del
+# usuario: "no quiero que haya ningún modelo por default. todos tienen que
+# poder eliminarse") — modelos_config ya no viene sembrada con nada al
+# arrancar (ver base_de_datos._migrar_esquema), así que no hace falta
+# distinguir "modelos del sistema" de "modelos del usuario": todos son del
+# usuario, y cualquier fila de la tabla se puede eliminar desde acá.
 
 COLUMNAS_TABLA = [
     ('nombre', 'Nombre'),
@@ -444,12 +441,6 @@ class PaginaModelos(QWidget):
         cfg = self._fila_seleccionada()
         if cfg is None:
             QMessageBox.information(self, "Elegí un modelo", "Seleccioná una fila de la tabla primero.")
-            return
-        if cfg['model_id'] in MODELOS_PROTEGIDOS:
-            QMessageBox.warning(
-                self, "No se puede eliminar",
-                "Este es uno de los modelos productivos del proyecto — pausalo en vez de eliminarlo.",
-            )
             return
         respuesta = QMessageBox.question(
             self, "Confirmar",
