@@ -179,6 +179,116 @@ confiar en el backtest de un ítem nuevo. Bolt of canvas, con 78x, está en una 
 resultados (+4-8%) son mucho más creíbles que los de Basalt pero deberían tomarse con cautela
 moderada, no con la misma confianza que los 6 ítems "limpios".
 
+## Fase 3 — ¿el método es mejor que el azar, con seguridad aceptable? (`busqueda_significancia.py`)
+
+Todo lo anterior tenía dos debilidades reales: los 8 ítems se eligieron a mano (sin
+garantía de que representen el universo real), y nunca se hizo un test de significancia
+formal — solo se comparó `win_rate`/ganancia sin ninguna referencia de azar. Esta fase
+ataca las dos cosas a la vez, pedido explícito del usuario tras ver los resultados de la
+fase 2 y sentir que "no se está logrando el objetivo del proyecto":
+
+1. **Ventana 90 días, solo `precios_1h`** (antes: 14 días) — 2.159 checkpoints horarios
+   walk-forward, 6.4x más que la fase 2.
+2. **Universo NO elegido a mano**: exactamente la configuración YA en producción
+   (`f2p10_100gp_clasif` — 10 ítems F2P más líquidos, precio≥100gp, Steel bar excluido),
+   re-derivada en cada checkpoint. Esto prueba el método tal como el usuario ya lo está
+   usando, no una selección optimista.
+3. **Test de significancia por permutación (Monte Carlo, 500 sorteos)**: en cada
+   checkpoint, un "jugador al azar" compra la MISMA cantidad de ítems que el modelo
+   predijo "sube" en ese momento, sorteados entre los MISMOS candidatos líquidos de ese
+   checkpoint — así una diferencia de resultado solo puede deberse a QUÉ eligió el
+   modelo, no a cuántas veces operó ni sobre qué universo. Se prefirió sobre un test
+   binomial contra 50% porque acá una "victoria" no vale lo mismo en gp para todos los
+   trades (montos de posición muy distintos por ítem) — y porque, como se ve abajo, el
+   propio azar no gana el 50% de las veces en este juego.
+
+### Resultado
+
+90 días, 5.639 trades del modelo real:
+
+| métrica | modelo real | azar (media de 500 sorteos) |
+|---|---|---|
+| ganancia total | **+11.892.000 gp** | −4.839.155 gp |
+| win rate | 38.6% (IC95%: 37.4%–39.9%) | 35.5% |
+| p-valor (permutación, ganancia) | **0.002** | — |
+| p-valor (permutación, win rate) | **0.002** | — |
+| p-valor (binomial vs. 50%) | 1.0 (no aplica — ver abajo) | — |
+
+**El método SÍ es mejor que el azar, con una seguridad muy alta** (p≈0.002, muy por
+debajo del 0.05 convencional; en 500 sorteos, casi ninguno igualó o superó el resultado
+real). El dato interesante es que el propio azar, en este universo y con esta mecánica
+de apuesta, **pierde plata en promedio** (−4.84M gp) — comprar F2P líquidos al azar y
+vender 1h después ya es un juego de valor esperado negativo (el impuesto GE y el spread
+se lo comen), así que el binomial test contra 50% da p=1.0 y es literalmente la pregunta
+equivocada acá: el modelo no necesita ganar más de la mitad de las veces, necesita ganar
+más seguido y/o más grande que elegir al azar en el mismo juego negativo — y eso sí lo
+logra, de forma medida, no solo intuida.
+
+### Pero la ganancia está muy concentrada
+
+| ítem | ganancia | trades | win rate |
+|---|---|---|---|
+| Cosmic rune | **+10.872.000 gp** | 564 | 64.9% |
+| Death rune | +3.350.000 gp | 311 | 44.7% |
+| Gold ore | +2.880.000 gp | 679 | 37.7% |
+| Chaos rune | +2.412.000 gp | 284 | 47.9% |
+| Law rune | +1.548.000 gp | 147 | 50.3% |
+| Gold bar | +630.000 gp | 104 | 51.0% |
+| Nature rune | +270.000 gp | 539 | 37.3% |
+| Yew logs | −576.000 gp | 894 | 34.5% |
+| Mithril ore | −1.170.000 gp | 769 | 36.2% |
+| Adamantite ore | −4.086.000 gp | 521 | 34.2% |
+| Coal | **−4.238.000 gp** | 827 | **22.9%** |
+
+**Cosmic rune solo explica el 91% de la ganancia total** (10.87M de 11.89M gp). Sin ese
+ítem, el resto del universo (los otros 10 ítems combinados) da apenas **+1.020.000 gp en
+90 días sobre 5.075 trades** (win rate 35.7%, casi idéntico al 35.5% del azar) — una
+señal mucho más débil, dentro de lo que podría ser ruido para varios de esos ítems
+individualmente.
+
+Verificación importante: el edge de Cosmic rune **no es un evento puntual** — se
+mantiene estable en las dos mitades de la ventana (primeros 45 días: 317 trades,
++5.904.000 gp, 62.8% win rate; últimos 45 días: 247 trades, +4.968.000 gp, 67.6% win
+rate). Es una señal real y persistente en ese ítem específico, no un artefacto de un
+período afortunado.
+
+**Coal es un problema aparte**: 22.9% de win rate en 827 trades es *peor* que el 35.5%
+promedio del azar — el modelo no solo no encuentra señal ahí, activamente se equivoca
+más seguido que adivinar al azar en ese mismo universo. Adamantite ore (34.2%, −4.09M
+gp) es un caso más débil de lo mismo. Mismo patrón que ya llevó a excluir Steel bar
+(2353) del universo productivo.
+
+### Lectura honesta para la pregunta del usuario
+
+*"¿Sirve este método para saber qué y cuándo comprar/vender, con una seguridad
+aceptable, mejor que el azar?"* — **Sí, en conjunto y con una seguridad estadística
+alta (p≈0.002)**, pero esa respuesta agregada esconde que la mayor parte del valor viene
+de una señal fuerte y estable en un solo ítem (Cosmic rune), mientras que dos ítems
+(Coal, Adamantite ore) restan valor de forma consistente y el resto del universo aporta
+una señal débil, no claramente distinguible del azar por sí sola. El método no es
+"ruido total" (la fase 2 con 8 ítems y 2 semanas no alcanzaba a distinguir esto), pero
+tampoco es una señal pareja y universal sobre cualquier ítem líquido F2P — es más
+preciso describirlo como "una señal real mezclada con varios ítems sin edge claro".
+
+### Recomendaciones concretas
+
+1. **Excluir Coal (453) y Adamantite ore (449) del universo productivo**, mismo criterio
+   que ya excluyó Steel bar — están restando plata de forma consistente, no por mala
+   suerte puntual.
+2. **Investigar qué hace distinto a Cosmic rune** antes de asumir que el resto del
+   universo puede llegar a ese nivel con más datos — puede ser un patrón de demanda
+   específico (consumo constante en quests/altares) que no se repite en runas de combate
+   como Nature/Chaos.
+3. **Repetir este mismo test de significancia (permutación) sobre un universo más amplio
+   que el F2P de 10 ítems** — si hay más "Cosmic runes" (ítems con edge fuerte y estable)
+   fuera de ese universo, vale la pena encontrarlos con el mismo método ahora que ya está
+   armado y validado, en vez de asumir que el edge encontrado es el único que existe.
+4. Esta fase reemplaza la lectura de la fase 2 como referencia principal para decidir
+   sobre el universo productivo — no por invalidar la fase 2 (los hallazgos de
+   calibración/triple-barrera siguen siendo válidos como mejoras de ejecución), sino
+   porque una muestra de 90 días/5.639 trades con test de significancia es una base mucho
+   más sólida que 8 ítems/2 semanas sin él para decidir QUÉ ítems mantener en producción.
+
 ## Cambios de código de esta fase
 
 - **`entrenador.py`**: `entrenar_modelo_global` arreglado para soportar `precio_minimo`/
