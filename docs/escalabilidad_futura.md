@@ -27,19 +27,28 @@ Crecimiento combinado (`5m`+`1h`+`6h`): ~228.960 filas/día ⇒ ~13.7 MB/día.
 ## Con la retención aplicada (`purgar_datos_antiguos`, `podar_metricas_por_item`, ver `mantenimiento.py`)
 
 - `precios_5m` (tope 30 días): converge a ~5.0M filas ≈ **~300 MB**, y ahí se estabiliza.
-- `precios_1h` (retención ya existente, 365 días): a los 6 meses (55.9 + 182 = 237.9 días) todavía
-  no alcanza el tope ⇒ ≈11.7M filas ≈ **~700 MB**; a los 12 meses ya lo alcanza y converge a
-  ~18M filas ≈ **~1.08 GB** (consistente con la estimación de "~40M filas/año en el peor caso"
-  que ya tenía el propio código, sobre un peor caso de ~4.600 ítems/hora — el promedio real
-  medido es bastante menor, ~2.053 ítems/hora).
+- `precios_1h` (**90 días** — recortado de 365 después de esta medición, ver
+  `mantenimiento.RETENCION_DIAS` y el bullet de `recolector.py` en `CLAUDE.md`: a 365 días cada
+  insert del backfill se volvía carísimo): con el throughput real medido hoy (~29.500 filas/día,
+  ver más abajo) converge a ≈2.7M filas ≈ **~160 MB** en vez de la ~1.08 GB estimada acá
+  originalmente con 365 días — la retención más corta es justo lo que evita ese crecimiento.
 - `precios_6h` (tope 365 días): converge a ~4.4M filas ≈ **~266 MB**.
 - `predicciones` (tope 180 días) y `model_metrics` (detalle por ítem podado a 90 días, agregado
-  indefinido): del orden de **decenas de MB** — no dominan el total, incluso con dos modelos
-  (`global_horario`/`global_diario`) y las filas adicionales del replay histórico.
+  indefinido): del orden de **decenas de MB** — no dominan el total.
 
-**Total estimado: ≈1.2 GB a los 6 meses, ≈1.8-2 GB a los 12 meses, y desde ahí el tamaño se
-estabiliza** — todas las tablas grandes alcanzan su tope de retención alrededor del mes 13, en
-vez de seguir creciendo para siempre.
+**Total estimado en régimen estable (con la retención de 90 días en `precios_1h`): ≈750 MB-1 GB**,
+no los ≈1.8-2 GB que daba la primera versión de esta cuenta.
+
+### Medición real (2026-08-31)
+
+`data/osrs_ge.db` pesa **965 MB** hoy, con `precios_1h` en 4.53M filas — por encima de la
+proyección de régimen estable de arriba, porque a esta fecha `precios_1h` tiene 153.6 días de
+historia real (no 90): la retención de 90 días está configurada pero `mantenimiento.
+purgar_datos_antiguos`/`job_semanal` no vienen corriendo con regularidad (no había ningún proceso
+`recolector.py` corriendo al momento de esta medición) — no es un problema de la proyección en sí,
+es que la purga todavía no alcanzó su régimen estable. Vale la pena confirmar que `job_semanal`
+esté corriendo de verdad (ver `docs/despliegue_24_7.md`) antes de tomar el número de 965 MB como
+el tamaño "de crucero" del proyecto.
 
 ## ¿Sigue siendo apropiado SQLite?
 
@@ -52,7 +61,8 @@ botella real en este tipo de proyectos casi nunca es el tamaño bruto del archiv
    `desde_timestamp`/`hasta_timestamp` en la query SQL (`obtener_precios_id`), no traen todo a
    pandas para recortar después.
 2. **Falta de mantenimiento** — ya resuelto: retención (`mantenimiento.py`) + `incremental_vacuum`
-   periódico (ver `docs/migracion_auto_vacuum.md`).
+   periódico (la DB ya está migrada a `auto_vacuum=INCREMENTAL`, confirmado con
+   `PRAGMA auto_vacuum` -> `2`).
 3. **Un solo escritor por diseño** — el recolector es el único proceso que escribe; dashboard,
    backtest y scripts de análisis son solo lectores. Mientras esto se mantenga así, WAL evita
    que los lectores bloqueen al escritor (o viceversa).

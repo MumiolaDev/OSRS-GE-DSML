@@ -271,9 +271,11 @@ def mantenimiento_vacuum(db, paginas=2000):
     libres por los DELETE de arriba, sin reescribir el archivo completo
     como haría un VACUUM sin argumentos (que bloquea la DB entera mientras
     corre — no aceptable en un job periódico automático). Requiere que la
-    DB ya haya sido migrada a auto_vacuum=INCREMENTAL una vez, a mano (ver
-    docs/migracion_auto_vacuum.md) — mientras eso no haya pasado, este
-    PRAGMA simplemente no libera nada (no falla).
+    DB esté en auto_vacuum=INCREMENTAL (`PRAGMA auto_vacuum` -> 2) — ya
+    migrada una vez, a mano, con `PRAGMA auto_vacuum=INCREMENTAL; VACUUM;`
+    sobre la DB detenida (reescribe el archivo completo, por eso es manual
+    y no parte de este job); mientras eso no haya pasado, este PRAGMA
+    simplemente no libera nada (no falla).
     """
     conn = sqlite3.connect(db.db_path)
     c = conn.cursor()

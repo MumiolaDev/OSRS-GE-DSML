@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import joblib
 import numpy as np
@@ -11,32 +12,34 @@ from preprocesamiento import build_training_set
 
 MODEL_DIR = "models"
 
-# Dos modelos, misma arquitectura y código de entrenamiento, distinta
-# cadencia de reentrenamiento (ver recolector.py job_horario/job_diario):
-# 'global_horario' es la señal rápida que consumen las alertas casi en
-# tiempo real, 'global_diario' es la referencia estable de calidad de largo
-# plazo. model_metrics.model_name y predicciones.model_version ya soportan
-# taggear ambos sin pisarse, así que no hace falta tocar el esquema para
-# esto — solo dejar de usar una constante fija (MODEL_VERSION) y parametrizar.
+# Nombres de referencia para model_name/model_version (model_metrics.model_name
+# y predicciones.model_version ya soportan taggear cualquier cantidad de
+# variantes sin pisarse) — NO son modelos sembrados por default: no hay
+# ningún modelo hasta que el usuario cree uno desde "Mis modelos" en la app
+# de escritorio (ver escritorio/paginas/pagina_modelos.py, que hoy crea
+# siempre un par regresor+clasificador con cadencia horaria y tabla
+# precios_1h). Estos nombres solo importan si el usuario elige exactamente
+# uno de ellos (o si un modelo apunta a la ruta fija de MODEL_PATHS más
+# abajo) — el resto del pipeline (job_horario/job_diario, dashboard.py) es
+# genérico sobre cualquier model_name.
 MODEL_NAME_HORARIO = "global_horario"
 MODEL_NAME_DIARIO = "global_diario"
 
-# Clasificador direccional (entrenar_clasificador_direccional): declarado acá
-# arriba, antes de MODEL_PATHS, porque las variantes productivas necesitan
-# una entrada en ese dict. global_horario_clasif (200 ítems F2P+members)
-# sigue siendo solo un experimento de comparación en model_metrics — no
-# tiene .pkl, no lo busques en MODEL_PATHS. f2p10_clasif (10 ítems F2P sin
-# filtro de precio) fue la primera variante promovida a producción, pero
-# quedó reemplazada por f2p10_100gp_clasif (mismos 10 ítems, pero con
-# precio_minimo=100 y Steel bar excluido) tras el backtest walk-forward de
-# 90 días: sin el filtro de precio la señal empataba con comprar a ciegas
-# (ver backtest.simular_clasificador_walkforward); con el filtro, la señal
-# convierte una estrategia perdedora (-67.6M gp comprando a ciegas en el
-# mismo rango) en ganadora (+7.3M gp). f2p10_clasif ya no se reentrena
-# desde recolector.job_horario, pero se deja el nombre/.pkl viejo sin
-# borrar (no rompe nada, solo queda desactualizado). Nombres distintos
-# para no pisarse en model_metrics (INSERT OR REPLACE por
-# model_name+train_timestamp).
+# Nombres de referencia para el clasificador direccional
+# (entrenar_clasificador_direccional) — mismo criterio que arriba, ninguno
+# sembrado por default. f2p10_100gp_clasif es el nombre usado en la
+# investigación de calidad de modelos de 2026-08-30/31 (10 ítems F2P más
+# líquidos, precio_minimo=100, excluir_item_ids=[2353, 449, 453] — Steel
+# bar, Adamantite ore, Coal): un test de significancia por permutación
+# sobre 90 días/5.639 trades mostró que esa configuración gana
+# significativamente más que el azar (p=0.002) comprando/vendiendo a 1h,
+# pero con la ganancia muy concentrada en un solo ítem (Cosmic rune, 91%
+# del total) y con Coal/Adamantite ore restando plata de forma consistente
+# (por eso están excluidos) — si se recrea un modelo así desde la app, ese
+# es el criterio de selección validado, aunque hoy la app solo permite
+# elegir ítems a mano (modo_seleccion='liquidez' no está expuesto en la UI,
+# ver pagina_modelos.py), así que replicarlo exacto requiere pasar esos
+# mismos parámetros vía crear_modelo_config directamente, no desde la UI.
 MODEL_NAME_CLASIFICADOR = "global_horario_clasif"
 MODEL_NAME_CLASIF_F2P = "f2p10_clasif"
 MODEL_NAME_CLASIF_F2P_100GP = "f2p10_100gp_clasif"
@@ -73,11 +76,52 @@ def entrenar_modelo_global(
     modo_evaluacion='holdout',
     calcular_metricas_horizonte=False,
     solo_f2p=False,
+    precio_minimo=None,
+    excluir_item_ids=None,
+    item_ids=None,
+    tabla='precios_1h',
+    ventana_dias=None,
 ):
     """
-    Entrena un modelo XGBoost sobre los `n_items` ítems más líquidos,
-    prediciendo el log-retorno del siguiente período (ver preprocesamiento.py
-    para el porqué de trabajar en espacio de retorno y no precio crudo).
+    Entrena un modelo XGBoost sobre un universo de ítems, prediciendo el
+    log-retorno del siguiente período (ver preprocesamiento.py para el
+    porqué de trabajar en espacio de retorno y no precio crudo).
+
+    item_ids (opcional): lista explícita de ítems a usar en vez de derivar
+    el universo desde obtener_top_items_liquidez[_hasta] con n_items/
+    solo_f2p/precio_minimo/excluir_item_ids — es lo que permite que un
+    modelo definido por el usuario (base_de_datos.modelos_config con
+    modo_seleccion='manual', ver recolector._entrenar_desde_config) entrene
+    sobre exactamente los ítems que eligió a mano, no sobre un ranking de
+    liquidez. Cuando se pasa, el resto de los filtros de selección se
+    ignoran por completo — el default (None) mantiene el comportamiento de
+    siempre.
+
+    precio_minimo/excluir_item_ids: ver
+    entrenar_clasificador_direccional/obtener_top_items_liquidez — mismos
+    filtros de selección por liquidez, ahora también disponibles acá (antes
+    solo existían en el clasificador; un modelo modo_seleccion='liquidez'
+    con estos filtros configurados los ignoraba silenciosamente si era de
+    tipo 'regresor', ver _kwargs_desde_modelo_config más abajo).
+
+    tabla ('precios_5m'|'precios_1h'|'precios_6h', default 'precios_1h' —
+    el comportamiento de siempre): granularidad de precios sobre la que se
+    entrena. Se guarda en el bundle (bundle['tabla']) para que
+    prediccion.py sepa contra qué tabla pedir el historial al pronosticar
+    — sin esto, un modelo entrenado sobre precios_6h pero consultado con
+    la tabla equivocada en inferencia tendría fuga de escala temporal
+    (train/serve skew) sin ningún error visible, los lags/medias móviles
+    significarían una cosa distinta a la que el modelo aprendió.
+
+    ventana_dias (opcional, default None = todo el historial disponible,
+    el comportamiento de siempre): acota el dataset de entrenamiento a los
+    últimos `ventana_dias` días relativos a `ahora_ts` (o a ahora mismo, en
+    vivo) — ver preprocesamiento.build_training_set. Pensado para modelos
+    de ítems puntuales (ver base_de_datos.modelos_config), donde entrenar
+    con años de historial de un solo ítem no necesariamente es mejor que
+    una ventana reciente más representativa del régimen actual del mercado
+    — no hay un valor "correcto" universal, es una decisión del usuario al
+    crear el modelo.
 
     model_name/model_path: distingue 'global_horario' de 'global_diario'
     (ver MODEL_PATHS arriba) — mismo código, dos cadencias de reentrenamiento
@@ -112,25 +156,41 @@ def entrenar_modelo_global(
     muestra acotada del test set — caro (multiplica el costo de inferencia
     por N_PASOS_HORIZONTE), por eso solo se activa desde job_diario (una vez
     al día), nunca en job_horario ni en el replay.
+
+    Devuelve True si se entrenó y se guardaron métricas/predicciones, False
+    si se cortó antes por falta de ítems/datos suficientes (sin excepción,
+    ver los logging.error de cada caso) — lo usa
+    recolector._entrenar_desde_config para no marcar
+    modelos_config.ultimo_entrenamiento_ts en una corrida que en realidad
+    no entrenó nada (ej. un modelo recién creado sobre un ítem sin
+    suficiente historial todavía).
     """
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
 
-    if ahora_ts is None:
-        item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p)
+    if item_ids is not None:
+        logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
     else:
-        item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p)
-    logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
+        if ahora_ts is None:
+            item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+        else:
+            item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+        logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
     if not item_ids:
         logging.error(
-            f"[{model_name}] Sin ítems líquidos disponibles — correr metricas.py antes de "
-            "entrenar en modo en vivo (o esperar más historial acumulado en modo replay)."
+            f"[{model_name}] Sin ítems disponibles — correr metricas.py antes de entrenar en "
+            "modo en vivo (o esperar más historial acumulado en modo replay)."
         )
-        return
+        return False
 
-    dataset = build_training_set(db, item_ids, hasta_timestamp=ahora_ts)
+    desde_ts = None
+    if ventana_dias is not None:
+        referencia = ahora_ts if ahora_ts is not None else int(time.time())
+        desde_ts = int(referencia - ventana_dias * 86400)
+
+    dataset = build_training_set(db, item_ids, tabla=tabla, hasta_timestamp=ahora_ts, desde_timestamp=desde_ts)
     if dataset.empty:
         logging.error(f"[{model_name}] No se pudo construir el dataset de entrenamiento (sin datos suficientes).")
-        return
+        return False
     logging.info(f"[{model_name}] Dataset combinado: {len(dataset)} filas, {dataset['item_id'].nunique()} ítems con features")
 
     if modo_evaluacion == 'walkforward':
@@ -139,7 +199,7 @@ def entrenar_modelo_global(
         test = dataset[dataset['timestamp_target'] == corte].copy()
         if train.empty or test.empty:
             logging.error(f"[{model_name}] Dataset insuficiente para walk-forward (train={len(train)}, test={len(test)}).")
-            return
+            return False
     else:
         corte = dataset['timestamp_target'].quantile(1 - TEST_FRACTION)
         train = dataset[dataset['timestamp_target'] <= corte]
@@ -192,6 +252,7 @@ def entrenar_modelo_global(
         'item_id_categories': dataset['item_id'].cat.categories,
         'members_categories': dataset['members'].cat.categories,
         'target_col': 'avg_low_price',
+        'tabla': tabla,
         'lags': 5,
         'ma_windows': [3, 6],
     }
@@ -236,6 +297,8 @@ def entrenar_modelo_global(
 
     if calcular_metricas_horizonte:
         _evaluar_y_guardar_horizontes(db, bundle, test, model_name, train_ts, modo_evaluacion)
+
+    return True
 
 
 def _evaluar_y_guardar_horizontes(db, bundle, test, model_name, train_ts, modo_evaluacion):
@@ -306,6 +369,9 @@ def entrenar_clasificador_direccional(
     solo_f2p=False,
     precio_minimo=None,
     excluir_item_ids=None,
+    item_ids=None,
+    tabla='precios_1h',
+    ventana_dias=None,
 ):
     """
     Entrena un XGBClassifier de 3 clases (baja/estable/sube) sobre el mismo
@@ -314,6 +380,16 @@ def entrenar_clasificador_direccional(
     cuadrático, no accuracy de signo — los movimientos chicos cerca de cero,
     que son la mayoría, pesan igual que uno grande en esa pérdida), este
     modelo optimiza directamente la clase correcta.
+
+    item_ids (opcional): ver entrenar_modelo_global — lista explícita de
+    ítems, en vez de derivar el universo desde obtener_top_items_liquidez
+    con n_items/solo_f2p/precio_minimo/excluir_item_ids (que se ignoran
+    por completo cuando se pasa).
+
+    tabla/ventana_dias: ver entrenar_modelo_global — misma granularidad de
+    precios y misma ventana de historial configurables, mismo motivo
+    (bundle['tabla'] evita el train/serve skew de inferir con la tabla
+    equivocada).
 
     solo_f2p: restringe el universo de ítems a free-to-play (ver
     obtener_top_items_liquidez) — ej. n_items=10, solo_f2p=True entrena
@@ -359,23 +435,33 @@ def entrenar_clasificador_direccional(
     si hiciera falta, aunque hoy no está enganchado al loop de replay.
 
     Devuelve (modelo, test) — `test` es el DataFrame del test set (NUNCA
-    visto en entrenamiento) con una columna 'clase_predicha' agregada,
-    listo para que backtest.py simule trades sobre datos genuinamente
-    held-out sin tener que reentrenar ni volver a correr el split. None si
-    no se pudo entrenar.
+    visto en entrenamiento) con columnas 'clase_predicha' y 'prob_sube'
+    (probabilidad softmax de la clase 'sube', para dimensionamiento por
+    confianza — ver busqueda_calibrada.py) agregadas, listo para que
+    backtest.py simule trades sobre datos genuinamente held-out sin tener
+    que reentrenar ni volver a correr el split. None si no se pudo
+    entrenar.
     """
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
 
-    if ahora_ts is None:
-        item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+    if item_ids is not None:
+        logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
     else:
-        item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
-    logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
+        if ahora_ts is None:
+            item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+        else:
+            item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+        logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
     if not item_ids:
-        logging.error(f"[{model_name}] Sin ítems líquidos disponibles.")
+        logging.error(f"[{model_name}] Sin ítems disponibles.")
         return None, None
 
-    dataset = build_training_set(db, item_ids, hasta_timestamp=ahora_ts)
+    desde_ts = None
+    if ventana_dias is not None:
+        referencia = ahora_ts if ahora_ts is not None else int(time.time())
+        desde_ts = int(referencia - ventana_dias * 86400)
+
+    dataset = build_training_set(db, item_ids, tabla=tabla, hasta_timestamp=ahora_ts, desde_timestamp=desde_ts)
     if dataset.empty:
         logging.error(f"[{model_name}] No se pudo construir el dataset de entrenamiento.")
         return None, None
@@ -404,8 +490,17 @@ def entrenar_clasificador_direccional(
     )
     modelo.fit(train[feature_cols], y_train_clase)
     y_pred_clase = modelo.predict(test[feature_cols])
+    proba = modelo.predict_proba(test[feature_cols])
     test['clase_predicha'] = y_pred_clase  # 0=baja, 1=estable, 2=sube — para backtest.py
     test['clase_real'] = y_test_clase  # idem, para poder medir accuracy sin recalcular después
+    # Probabilidad de la clase 'sube' (softmax, no solo el argmax) — a
+    # diferencia de clase_predicha (sí/no), esto es una medida continua de
+    # confianza que un backtest puede usar para dimensionar la posición
+    # (más confianza -> más plata en esa señal) en vez de apostar el mismo
+    # monto fijo a toda señal 'sube', sea 0.34 o 0.95 de probabilidad. No
+    # cambia ningún consumidor existente (columna nueva, se ignora si no se
+    # usa) — ver busqueda_calibrada.py para el primer uso real.
+    test['prob_sube'] = proba[:, 2]
 
     accuracy_multiclase = float((y_pred_clase == y_test_clase).mean())
     # Direccional "pura": solo entre los casos donde ni la clase real ni la
@@ -445,6 +540,7 @@ def entrenar_clasificador_direccional(
             'item_id_categories': dataset['item_id'].cat.categories,
             'members_categories': dataset['members'].cat.categories,
             'target_col': 'avg_low_price',
+            'tabla': tabla,
             'lags': 5,
             'ma_windows': [3, 6],
             'umbral_pct': umbral_pct,
@@ -455,6 +551,65 @@ def entrenar_clasificador_direccional(
         logging.info(f"[{model_name}] Modelo guardado en {model_path}")
 
     return modelo, test
+
+
+def _kwargs_desde_modelo_config(cfg):
+    """
+    Traduce una fila de modelos_config (ver
+    base_de_datos.OSRSBaseDatos._fila_a_modelo_config) a los kwargs
+    comunes que entrenar_modelo_global/entrenar_clasificador_direccional
+    esperan — compartido entre recolector._entrenar_desde_config
+    (reentrenamiento en vivo, programado) y
+    replay_historico.ejecutar_replay_modelo (walk-forward inicial al crear
+    un modelo), para no tener el mismo mapeo modo_seleccion/tipo
+    duplicado en dos archivos (antes solo vivía en recolector.py).
+
+    No incluye ahora_ts/guardar_en_disco/modo_evaluacion/
+    calcular_metricas_horizonte — esos dependen de PARA QUÉ se está
+    entrenando (en vivo vs. un checkpoint del pasado), los agrega el
+    llamador vía entrenar_desde_config(db, cfg, **overrides).
+    """
+    kwargs = dict(
+        model_name=cfg['model_id'], tabla=cfg.get('tabla') or 'precios_1h',
+        ventana_dias=cfg.get('ventana_dias'),
+    )
+    if cfg['modo_seleccion'] == 'manual':
+        kwargs['item_ids'] = cfg['item_ids']
+    else:
+        kwargs['n_items'] = cfg['n_items']
+        kwargs['solo_f2p'] = cfg['solo_f2p']
+        # precio_minimo/excluir_item_ids ahora los soportan tanto el
+        # regresor como el clasificador (ver entrenar_modelo_global) — antes
+        # esto solo se pasaba para 'clasificador' y un modelo 'regresor' en
+        # modo liquidez con estos filtros configurados los ignoraba sin
+        # avisar (bug encontrado en la primera campaña de
+        # busqueda_hiperparametros.py: 3 filas entrenaron sobre runas/
+        # Feather pese a precio_minimo=100).
+        kwargs['precio_minimo'] = cfg['precio_minimo']
+        kwargs['excluir_item_ids'] = cfg['excluir_item_ids']
+    if cfg['tipo'] == 'clasificador' and cfg['umbral_pct'] is not None:
+        kwargs['umbral_pct'] = cfg['umbral_pct']
+    return kwargs
+
+
+def entrenar_desde_config(db, cfg, **overrides):
+    """
+    Llama entrenar_modelo_global o entrenar_clasificador_direccional según
+    cfg['tipo'], con los kwargs derivados de _kwargs_desde_modelo_config +
+    `overrides` (típicamente ahora_ts, guardar_en_disco, modo_evaluacion,
+    calcular_metricas_horizonte).
+
+    Devuelve exactamente lo que devuelve la función subyacente sin
+    envolverlo — True/False para el regresor, (modelo, test) para el
+    clasificador — el llamador decide cómo interpretar el éxito en cada
+    caso (ver recolector._entrenar_desde_config y
+    replay_historico.ejecutar_replay_modelo).
+    """
+    kwargs = _kwargs_desde_modelo_config(cfg)
+    kwargs.update(overrides)
+    if cfg['tipo'] == 'clasificador':
+        return entrenar_clasificador_direccional(db, **kwargs)
+    return entrenar_modelo_global(db, **kwargs)
 
 
 if __name__ == "__main__":

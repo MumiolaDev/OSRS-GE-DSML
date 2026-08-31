@@ -24,6 +24,10 @@ models/
 logs/
 *.log
 
+# Config local de la app de escritorio (token de Telegram, ruta de DB) --
+# nunca credenciales commiteadas, ver configuracion.py
+config.json
+
 # Jupyter
 .ipynb_checkpoints/
 

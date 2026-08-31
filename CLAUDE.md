@@ -6,11 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 OSRS GE Predictor de Precios: pipeline que recolecta precios de compra/venta del Grand Exchange
 de Old School RuneScape desde la API pública `prices.runescape.wiki`, los almacena en SQLite,
-calcula un screener de oportunidades de flip y entrena dos modelos (XGBoost, misma arquitectura,
-distinta cadencia de reentrenamiento) que predicen el precio del siguiente período. Corre pensado
-para 24/7 (ver `docs/despliegue_24_7.md`), manda alertas de oportunidades por Telegram
-(`alertas.py`) y expone un dashboard de monitoreo en Streamlit; la futura "app web" para el
-usuario final todavía no existe.
+calcula un screener de oportunidades de flip y entrena modelos XGBoost (regresor de precio +
+clasificador direccional) que el usuario define él mismo, con los ítems y la ventana de
+historial que elija — no hay ningún modelo sembrado por default (pedido explícito del usuario:
+"no quiero que haya ningún modelo por default, todos tienen que poder eliminarse"), `modelos_config`
+arranca vacía y el pipeline funciona igual de bien sin ningún modelo creado todavía (el screener
+no depende de ninguno). Corre pensado para 24/7 (ver `docs/despliegue_24_7.md`), manda alertas de
+oportunidades por Telegram (`alertas.py`), expone un dashboard de monitoreo en Streamlit
+(`dashboard.py`, solo lectura, para el desarrollador) y una app de escritorio en PySide6/Qt
+(`escritorio/`, ver su propio bullet más abajo) para el usuario final.
 
 ## Comandos
 
@@ -42,20 +46,26 @@ osrs_ge_api.py → recolector.py → base_de_datos.py (SQLite)
                      │  (schedule alineado al reloj: 5m/1h/6h + job_horario + job_diario + job_semanal)
                      ├─→ metricas.py ────────────→ resumen_actual (screener)
                      ├─→ preprocesamiento.py → entrenador.py → model_metrics / predicciones
-                     │         │                    (dos modelos: global_horario / global_diario)
+                     │         │                    (regresor + clasificador, uno por cada modelo
+                     │         │                     que el usuario haya creado en modelos_config —
+                     │         │                     ninguno por default, ver escritorio/)
                      │         └─→ evaluacion.py (accuracy direccional + MAE por horizonte)
-                     ├─→ replay_historico.py (walk-forward al rellenar huecos del pasado)
+                     ├─→ replay_historico.py (walk-forward al rellenar huecos del pasado o al crear un modelo)
                      ├─→ alertas.py (Telegram, al final de job_horario)
                      └─→ mantenimiento.py (retención/downsampling/vacuum de todas las tablas)
 
 prediccion.py (pronóstico recursivo) y backtest.py (simulación histórica) reusan el modelo
 guardado y las predicciones walk-forward — no están en el loop del recolector.
 
-baseline.py (reglas triviales) es un experimento de comparación fuera del loop del
-recolector. entrenador.entrenar_clasificador_direccional() SÍ está enganchado a job_horario
-para su variante productiva (f2p10_100gp_clasif) — ver el bullet de entrenador.py.
+baseline.py (reglas triviales) es un experimento de comparación fuera del loop del recolector.
+entrenador.entrenar_clasificador_direccional() se reentrena desde job_horario/job_diario para
+CUALQUIER modelo de tipo='clasificador' que el usuario haya creado con esa cadencia — sin
+distinción de código entre regresor y clasificador ni entre "modelos del sistema" y "modelos del
+usuario" (no existen los primeros) — ver el bullet de entrenador.py.
 
 dashboard.py (Streamlit) lee resumen_actual / model_metrics / predicciones — solo lectura.
+escritorio/ (PySide6/Qt) es la app de escritorio para el usuario final — lee y ESCRIBE
+modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además de leer el resto.
 ```
 
 - **`osrs_ge_api.py`**: cliente de la API. Los endpoints `/5m`, `/1h`, `/6h` devuelven un
@@ -80,9 +90,12 @@ dashboard.py (Streamlit) lee resumen_actual / model_metrics / predicciones — s
   sin perder esa garantía**; sacar el índice secundario de `timestamp` (no la PK) casi no cambia
   el tiempo, ya se probó. La única palanca que funciona de verdad es acotar el rango del backfill
   (`insertar_precios()` ya usa `executemany`, no loop de `execute()` — eso sí ayudó, ~2x).
-  `job_horario` (cada hora, :05) refresca `resumen_actual`, reentrena `global_horario` y evalúa
-  alertas; `job_diario` (03:00 UTC) reentrena `global_diario` y calcula métricas de horizonte;
-  `job_semanal` (domingo 04:00 UTC, con catch-up si se perdió la ventana — ver
+  `job_horario` (cada hora, :05) refresca `resumen_actual`, reentrena todos los modelos de
+  `modelos_config` con `cadencia='horaria'`/`estado='activo'` (ninguno por default — si el
+  usuario no creó ningún modelo desde la app de escritorio todavía, no reentrena nada) y evalúa
+  alertas; `job_diario` (03:00 UTC) hace lo mismo para `cadencia='diaria'` y calcula métricas de
+  horizonte para los de tipo='regresor'; `job_semanal` (domingo 04:00 UTC, con catch-up si se
+  perdió la ventana — ver
   `verificar_catchup_semanal`) corre la retención. `rellenar_huecos_al_inicio` además dispara
   `replay_historico.ejecutar_replay()` sobre los huecos detectados en `precios_1h` — pero acota el
   límite inferior del hueco a `mantenimiento.RETENCION_DIAS[tabla]` (no a `MIN(timestamp)`): sin
@@ -105,45 +118,43 @@ dashboard.py (Streamlit) lee resumen_actual / model_metrics / predicciones — s
   REPLACE`; un `model_name` nuevo para cada variante/experimento evita pisar filas de otro.
   `obtener_precios_multi(item_ids, tabla, ...)` trae varios ítems en una sola query — preferirla
   sobre un loop de `obtener_precios_id` por ítem (ese loop, con ~200 conexiones SQLite
-  separadas, era el cuello de botella real de `build_training_set`).
+  separadas, era el cuello de botella real de `build_training_set`). `modelos_config`
+  (`crear_modelo_config`/`obtener_modelo_config`/`actualizar_modelo_config`/
+  `eliminar_modelo_config`/`listar_modelos_config`) arranca **vacía** en una DB nueva — no hay
+  ningún modelo sembrado por default (pedido explícito del usuario, ver `escritorio/`), así que
+  `job_horario`/`job_diario` (`recolector.py`) no tienen nada que reentrenar hasta que el usuario
+  cree uno. `contar_modelos_config_activos()` topea `MAX_MODELOS_ACTIVOS` (8) contando solo
+  `cadencia != 'manual'` — un par regresor+clasificador horario (ver `escritorio/`) consume 2 de
+  esos 8 slots.
 - **`preprocesamiento.py`**: features en espacio logarítmico (lags y medias móviles de
   log-precio/log-volumen, encoding cíclico de hora y día de semana) y target = log-retorno del
   siguiente período, no precio crudo — necesario para que un modelo global sea comparable entre
   ítems de escalas de precio muy distintas. `build_training_set(..., hasta_timestamp=...)` arma
   el dataset multi-ítem, opcionalmente acotado a un momento del pasado.
-- **`entrenador.py`**: entrena un `XGBRegressor` (misma arquitectura para las dos cadencias,
-  `MODEL_NAME_HORARIO`/`MODEL_NAME_DIARIO`) sobre los ~200 ítems más líquidos, con split temporal
-  (no aleatorio, para no filtrar futuro hacia el pasado) — `modo_evaluacion='holdout'` en vivo,
-  `'walkforward'` en el replay (entrena con todo menos el último período y evalúa solo ahí, mucho
-  más barato que repetir un split 80/20 en cada checkpoint histórico). `ahora_ts` simula un
-  momento del pasado; `guardar_en_disco=False` evita pisar el `.pkl` productivo durante el
-  replay. Guarda el modelo en `models/` y persiste métricas/predicciones en la DB, taggeadas por
-  `model_name`/`model_version` para que ambas cadencias convivan sin pisarse.
+- **`entrenador.py`**: entrena un `XGBRegressor` con split temporal (no aleatorio, para no
+  filtrar futuro hacia el pasado) — `modo_evaluacion='holdout'` en vivo, `'walkforward'` en el
+  replay (entrena con todo menos el último período y evalúa solo ahí, mucho más barato que
+  repetir un split 80/20 en cada checkpoint histórico). `ahora_ts` simula un momento del pasado;
+  `guardar_en_disco=False` evita pisar el `.pkl` durante el replay. Guarda el modelo en `models/`
+  y persiste métricas/predicciones en la DB, taggeadas por `model_name`/`model_version` para que
+  cualquier cantidad de modelos convivan sin pisarse — no hay ningún modelo sembrado por default
+  (ver el bullet de `base_de_datos.py` y de `escritorio/`), `MODEL_NAME_HORARIO`/
+  `MODEL_NAME_DIARIO`/`MODEL_NAME_CLASIF_F2P_100GP`/etc. son solo nombres de referencia que la
+  app/el dashboard usan como default si un modelo con ese nombre exacto llega a existir.
   `entrenar_clasificador_direccional()` (mismo archivo) es un `XGBClassifier` de 3 clases
   (sube/estable/baja, `UMBRAL_CLASIF_PCT`) en vez de derivar la dirección del signo de la
   regresión — **da bastante mejor accuracy direccional que el regresor** (validado
   walk-forward, no solo un split), aunque esa métrica sola no garantiza ganancia real: hace
-  falta el backtest de PnL (`backtest.simular_clasificador_walkforward`) para confirmarlo —
-  ver el bullet de `backtest.py`. Producción usa `solo_f2p=True, n_items=10,
-  precio_minimo=100, excluir_item_ids=[2353]` (Steel bar) —
-  `MODEL_NAME_CLASIF_F2P_100GP="f2p10_100gp_clasif"` — tras un backtest walk-forward de 90
-  días que mostró que sin el filtro de precio la señal empataba con comprar a ciegas (ambos
-  ítems baratos y caros mezclados), mientras que con `precio_minimo=100` convierte una
-  estrategia perdedora (-67.6M gp comprando a ciegas en el mismo rango) en ganadora (+7.3M
-  gp) — Steel bar se excluyó puntualmente porque perdía plata con las dos estrategias.
-  `job_horario` (`recolector.py`) la reentrena y persiste un `.pkl` cada hora
-  (`guardar_en_disco=True`, entrada propia en `MODEL_PATHS`), y el dashboard la muestra en el
-  tab "Señal direccional (F2P)" vía `prediccion.pronosticar_clase_item()` (inferencia en vivo
-  a horizonte fijo de 1 paso, sin recursión — no hay tabla de predicciones categóricas, a
-  propósito, para no migrar el esquema de `predicciones`). La variante anterior sin filtro de
-  precio (`MODEL_NAME_CLASIF_F2P="f2p10_clasif"`) ya no se reentrena pero queda su `.pkl`/
-  historial en `model_metrics` sin borrar. La variante de 200 ítems
-  (`MODEL_NAME_CLASIFICADOR="global_horario_clasif"`) sigue siendo solo comparación en
-  `model_metrics` y en `backtest.simular_clasificador*`, sin `.pkl`. Ninguna variante
-  alimenta `alertas.py` todavía. `precio_minimo`/`excluir_item_ids` son parámetros de
+  falta el backtest de PnL (`backtest.simular_clasificador_walkforward`) para confirmarlo — ver
+  el bullet de `backtest.py`. Una configuración concreta (`solo_f2p=True, n_items=10,
+  precio_minimo=100, excluir_item_ids=[2353, 449, 453]`, Steel bar/Adamantite ore/Coal) quedó
+  validada con un test de significancia por permutación sobre 90 días/5.639 trades (gana
+  significativamente más que el azar, p=0.002, aunque con la ganancia muy concentrada en un
+  solo ítem — ver el comentario junto a `MODEL_NAME_CLASIF_F2P_100GP` para el detalle completo)
+  — es una recomendación validada, no algo que corra automáticamente: el usuario tiene que
+  crearlo él mismo. `precio_minimo`/`excluir_item_ids` son parámetros de
   `obtener_top_items_liquidez[_hasta]` (`base_de_datos.py`), enhebrados también por
-  `replay_historico.ejecutar_replay_clasificador` y `backtest.simular_clasificador*` — no son
-  un hack puntual de este cambio.
+  `replay_historico.ejecutar_replay_clasificador` y `backtest.simular_clasificador*`.
 - **`baseline.py`**: reglas triviales sin entrenar nada (`baseline_flat`="no cambia",
   `baseline_momentum`="sigue la tendencia anterior"), guardadas en `model_metrics` con el mismo
   esquema para comparar de igual a igual — el regresor de `entrenador.py` apenas le gana a
@@ -189,17 +200,43 @@ dashboard.py (Streamlit) lee resumen_actual / model_metrics / predicciones — s
   (`precios_5m`/`precios_6h`/`predicciones`, esta última con 180 días fijo);
   `podar_metricas_por_item` (poda solo el detalle por
   ítem de `model_metrics`, conserva el agregado indefinidamente) y `mantenimiento_vacuum`
-  (`PRAGMA incremental_vacuum`, requiere la migración de `docs/migracion_auto_vacuum.md` para
-  liberar espacio de verdad). `ejecutar_mantenimiento_semanal()` agrupa todo — ver proyección de
-  tamaño en `docs/escalabilidad_futura.md`.
+  (`PRAGMA incremental_vacuum` — la DB ya está migrada a `auto_vacuum=INCREMENTAL`, confirmado
+  con `PRAGMA auto_vacuum` -> `2`; sin esa migración el PRAGMA no libera nada, no falla).
+  `ejecutar_mantenimiento_semanal()` agrupa todo — ver proyección de tamaño en
+  `docs/escalabilidad_futura.md`.
 - **`dashboard.py`**: panel de monitoreo en Streamlit (screener con filtro de liquidez, calidad
   del modelo en el tiempo por modelo/modo/horizonte, predicción vs realidad, pronóstico a
-  futuro, señal direccional F2P). Selector de modelo (`global_horario`/`global_diario`) en los
-  tabs relevantes. El tab "Señal direccional (F2P)" es aparte porque `f2p10_100gp_clasif` predice una
-  clase categórica (baja/estable/sube), no un precio continuo — muestra los 10 ítems F2P de una
-  sola pasada (tabla, no gráfico de línea), calculado en vivo con
-  `prediccion.pronosticar_clase_item()` y cruzado con `margen_neto`/`roi_pct` de
-  `resumen_actual` para que sea accionable. Nunca escribe en la DB.
+  futuro, señal direccional F2P). Selector de modelo (`global_horario`/`global_diario` por
+  default) en los tabs relevantes — son solo nombres de referencia (ver el bullet de
+  `entrenador.py`): si el usuario no creó un modelo con exactamente ese nombre desde la app de
+  escritorio, esos tabs muestran "no hay modelo entrenado" en vez de romper (`FileNotFoundError`
+  capturado en cada tab). El tab "Señal direccional (F2P)" es aparte porque un clasificador
+  predice una clase categórica (baja/estable/sube), no un precio continuo — calculado en vivo con
+  `prediccion.pronosticar_clase_item()` y cruzado con `margen_neto`/`roi_pct` de `resumen_actual`
+  para que sea accionable, default `f2p10_100gp_clasif` (mismo caso: solo si existe). Nunca
+  escribe en la DB.
+- **`escritorio/`**: app de escritorio en PySide6/Qt para el usuario final — 4 tabs
+  deliberadamente pocas (Inicio, Oportunidades, Mis modelos, Configuración), a diferencia del
+  dashboard de Streamlit que tiene mucha más carga de información pensada para el desarrollador.
+  `escritorio/main.py` es el punto de entrada (`python -m escritorio.main`).
+  `escritorio/paginas/pagina_inicio.py` controla el hilo del recolector (arrancar/parar) y
+  muestra progreso real del relleno de huecos/replay. `pagina_oportunidades.py` fusiona
+  screener + señal direccional de cualquier clasificador activo en una sola tabla (no una
+  variante F2P fija). `pagina_modelos.py` es la única pantalla que ESCRIBE en `modelos_config`:
+  "+ Nuevo modelo" crea siempre un par regresor+clasificador (cadencia horaria, tabla
+  precios_1h) sobre los ítems que el usuario elija, con la ventana de historial como único otro
+  parámetro configurable — no hay ningún modelo protegido contra borrado, todos son del usuario
+  (ver el bullet de `base_de_datos.py`: `modelos_config` arranca vacía). Al seleccionar un
+  regresor en la tabla, muestra un gráfico (`pyqtgraph`) de predicted_price vs. actual_price
+  (tabla `predicciones`) para un ítem elegido del propio modelo — el clasificador no tiene
+  equivalente (no persiste un precio continuo) y muestra un mensaje en vez de un gráfico vacío.
+  El walk-forward corre una vez al crear el modelo (todo el historial disponible en ese
+  momento); "Rehacer walk-forward" (cualquier tipo, regresor o clasificador) pide una ventana en
+  días y vuelve a correr `ejecutar_replay_modelo` acotado a eso — pensado para cubrir historial
+  recolectado después de la creación sin recorrer meses ya cubiertos; resumible como siempre
+  (`existe_checkpoint` saltea lo que ya corrió, no lo recalcula).
+  `pagina_configuracion.py` edita el token de Telegram y la ruta de la DB, persistidos en
+  `config.json` (`configuracion.py`).
 
 ## Convenciones del código
 

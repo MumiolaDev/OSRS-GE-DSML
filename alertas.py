@@ -13,13 +13,13 @@ scheduler propio.
 """
 
 import logging
-import os
 import sqlite3
 import time
 
 import pandas as pd
 import requests
 
+import configuracion
 from entrenador import MODEL_NAME_HORARIO
 from metricas import filtrar_screener_liquido, margen_neto_proyectado
 from prediccion import cargar_modelo, pronosticar_item
@@ -30,17 +30,23 @@ TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 def enviar_mensaje_telegram(texto, token=None, chat_id=None):
     """
     POST a la Bot API de Telegram (requests, ya es dependencia del proyecto
-    — no hace falta un SDK nuevo para un envío unidireccional simple). Si
-    faltan las credenciales, loguea un warning y no rompe el job que la
-    llama: las alertas son un extra, no deben tumbar job_horario si todavía
-    no están configuradas.
+    — no hace falta un SDK nuevo para un envío unidireccional simple).
+    token/chat_id, si no se pasan, salen de configuracion.obtener() —
+    variable de entorno TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID si está seteada
+    (despliegue en modo servidor/NSSM, ver docs/despliegue_24_7.md) o si no
+    config.json (editado desde la app de escritorio, ver
+    escritorio/paginas/pagina_configuracion.py). Si faltan las
+    credenciales en cualquiera de los dos lados, loguea un warning y no
+    rompe el job que la llama: las alertas son un extra, no deben tumbar
+    job_horario si todavía no están configuradas.
     """
-    token = token or os.environ.get('TELEGRAM_BOT_TOKEN')
-    chat_id = chat_id or os.environ.get('TELEGRAM_CHAT_ID')
+    token = token or configuracion.obtener('telegram_bot_token')
+    chat_id = chat_id or configuracion.obtener('telegram_chat_id')
     if not token or not chat_id:
         logging.warning(
-            "alertas.py: faltan TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID como variables de entorno "
-            "— se omite el envío. Ver docs/despliegue_24_7.md para configurarlas."
+            "alertas.py: faltan las credenciales de Telegram (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID "
+            "como variables de entorno, o token/chat_id en config.json) — se omite el envío. "
+            "Ver docs/despliegue_24_7.md o la pestaña Configuración de la app."
         )
         return False
 

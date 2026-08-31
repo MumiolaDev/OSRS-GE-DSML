@@ -7,10 +7,7 @@ from datetime import datetime
 from osrs_ge_api import OSRSGeAPI
 from base_de_datos import OSRSBaseDatos
 from metricas import calcular_resumen_todos
-from entrenador import (
-    entrenar_modelo_global, MODEL_NAME_HORARIO, MODEL_NAME_DIARIO,
-    entrenar_clasificador_direccional, MODEL_NAME_CLASIF_F2P_100GP,
-)
+from entrenador import entrenar_desde_config
 from mantenimiento import ejecutar_mantenimiento_semanal
 
 
@@ -96,23 +93,55 @@ INTERVALS = {
 TABLA_POR_INTERVALO = {'5m': 'precios_5m', '1h': 'precios_1h', '6h': 'precios_6h'}
 
 
+def _entrenar_desde_config(db, cfg, guardar_en_disco=True, calcular_metricas_horizonte=False):
+    """
+    Reentrena (en vivo) un modelo de modelos_config — regresor o
+    clasificador, sobre su tabla/ventana/universo de ítems tal cual estén
+    configurados (ver entrenador._kwargs_desde_modelo_config, que interpreta
+    modo_seleccion='manual'/'liquidez') — es lo que le permite a
+    job_horario/job_diario reentrenar cualquier modelo que el usuario
+    defina desde la app de escritorio, sin ningún caso especial: no hay
+    ningún modelo sembrado por default (modelos_config arranca vacía), así
+    que si el usuario no creó ninguno todavía, job_horario/job_diario
+    simplemente no tienen nada que reentrenar esa corrida.
+
+    Actualiza modelos_config.ultimo_entrenamiento_ts SOLO si el
+    entrenamiento efectivamente corrió (no en un corte temprano por falta
+    de ítems/historial suficiente) — así la app de escritorio no muestra
+    "entrenado hace un momento" sobre un modelo que en realidad nunca
+    llegó a entrenar. No se hace dentro de un try/except acá porque el
+    llamador (job_horario/job_diario) ya envuelve cada llamada a esta
+    función en el suyo propio.
+
+    Devuelve True/False según si entrenó de verdad — lo usa
+    escritorio/paginas/pagina_modelos.py para el botón "Entrenar ahora".
+    """
+    overrides = dict(guardar_en_disco=guardar_en_disco)
+    if cfg['tipo'] != 'clasificador':
+        overrides['calcular_metricas_horizonte'] = calcular_metricas_horizonte
+
+    resultado = entrenar_desde_config(db, cfg, **overrides)
+    exito = (resultado[1] is not None) if cfg['tipo'] == 'clasificador' else bool(resultado)
+
+    if exito:
+        db.actualizar_modelo_config(cfg['model_id'], ultimo_entrenamiento_ts=int(time.time()))
+    return exito
+
+
 def job_horario(db):
     """
     Corre cada hora (:05, unos minutos después de collect_1h para no competir
     por I/O/CPU con la recolección): refresca resumen_actual y reentrena
-    'global_horario' — la cadencia rápida, pensada para alertas casi en
-    tiempo real. Si el refresh del resumen falla, se salta el
-    reentrenamiento: obtener_top_items_liquidez() depende de que
-    resumen_actual esté fresca, así que reentrenar con una tabla vieja/vacía
-    no tiene sentido. También reentrena 'f2p10_100gp_clasif'
-    (entrenador.entrenar_clasificador_direccional), la variante productiva
-    del clasificador direccional — 10 ítems F2P más líquidos con
-    precio_minimo=100 y Steel bar excluido (item_id 2353), la configuración
-    que en el backtest walk-forward de 90 días convirtió una estrategia
-    perdedora (comprar a ciegas: -67.6M gp) en ganadora (+7.3M gp); la
-    variante sin filtro de precio no le ganaba a comprar a ciegas — en su
-    propio try/except independiente, para que un fallo ahí no afecte al
-    reentrenamiento de global_horario ni a las alertas.
+    todos los modelos de modelos_config con cadencia='horaria' y
+    estado='activo' (ver base_de_datos.py y _entrenar_desde_config) — todos
+    definidos por el usuario desde la app de escritorio, ninguno sembrado
+    por default (ver base_de_datos._migrar_esquema): sin modelos creados
+    todavía, este loop simplemente no tiene nada que reentrenar, no es un
+    error. Si el refresh del resumen falla, se salta el reentrenamiento
+    entero: obtener_top_items_liquidez() (la usan los modelos con
+    modo_seleccion='liquidez') depende de que resumen_actual esté fresca.
+    Cada modelo se reentrena en su propio try/except, para que un fallo en
+    uno no tumbe a los demás ni a las alertas.
     """
     try:
         logging.info("Job horario: refrescando resumen_actual...")
@@ -123,20 +152,12 @@ def job_horario(db):
         logging.error(f"Error refrescando resumen_actual, se omite el reentrenamiento: {e}")
         return
 
-    try:
-        logging.info("Job horario: reentrenando modelo global_horario...")
-        entrenar_modelo_global(db, model_name=MODEL_NAME_HORARIO)
-    except Exception as e:
-        logging.error(f"Error reentrenando global_horario: {e}")
-
-    try:
-        logging.info(f"Job horario: reentrenando {MODEL_NAME_CLASIF_F2P_100GP}...")
-        entrenar_clasificador_direccional(
-            db, n_items=10, solo_f2p=True, precio_minimo=100, excluir_item_ids=[2353],  # Steel bar
-            model_name=MODEL_NAME_CLASIF_F2P_100GP, guardar_en_disco=True,
-        )
-    except Exception as e:
-        logging.error(f"Error reentrenando {MODEL_NAME_CLASIF_F2P_100GP}: {e}")
+    for cfg in db.listar_modelos_config(cadencia='horaria', estado='activo'):
+        try:
+            logging.info(f"Job horario: reentrenando {cfg['model_id']} ({cfg['tipo']})...")
+            _entrenar_desde_config(db, cfg, guardar_en_disco=True)
+        except Exception as e:
+            logging.error(f"Error reentrenando {cfg['model_id']}: {e}")
 
     try:
         from alertas import evaluar_alertas
@@ -147,17 +168,25 @@ def job_horario(db):
 
 def job_diario(db):
     """
-    Corre una vez al día a las 03:00: reentrena 'global_diario' — la
-    cadencia estable, referencia de calidad de largo plazo — y calcula
-    métricas de horizonte (2..6 pasos, evaluacion.py), que son caras y por
-    eso no se calculan en cada corrida horaria. Reusa resumen_actual, ya
-    refrescada por job_horario en la misma hora — no la recalcula de nuevo.
+    Corre una vez al día a las 03:00: reentrena todos los modelos de
+    modelos_config con cadencia='diaria' y estado='activo' (ninguno
+    sembrado por default, todos definidos por el usuario) y calcula
+    métricas de horizonte
+    (2..6 pasos, evaluacion.py) para los de tipo='regresor' — el
+    clasificador no tiene esa noción, ver entrenador.py — que son caras y
+    por eso no se calculan en cada corrida horaria. Reusa resumen_actual,
+    ya refrescada por job_horario en la misma hora — no la recalcula de
+    nuevo.
     """
-    try:
-        logging.info("Job diario: reentrenando modelo global_diario...")
-        entrenar_modelo_global(db, model_name=MODEL_NAME_DIARIO, calcular_metricas_horizonte=True)
-    except Exception as e:
-        logging.error(f"Error reentrenando global_diario: {e}")
+    for cfg in db.listar_modelos_config(cadencia='diaria', estado='activo'):
+        try:
+            logging.info(f"Job diario: reentrenando {cfg['model_id']} ({cfg['tipo']})...")
+            _entrenar_desde_config(
+                db, cfg, guardar_en_disco=True,
+                calcular_metricas_horizonte=(cfg['tipo'] == 'regresor'),
+            )
+        except Exception as e:
+            logging.error(f"Error reentrenando {cfg['model_id']}: {e}")
 
 
 def job_semanal(db):
@@ -225,13 +254,28 @@ def backfill(interval, start_ts, end_ts, db, delay=1.0):
     return n_calls, total_filas
 
 
-def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0):
+def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=None, debe_detener=None):
     """
     Como `backfill()`, pero solo pide a la API los timestamps que la tabla
     todavía no tiene — pensado para rellenar huecos de recolección
     intermitente sin volver a pedir lo que ya está guardado (INSERT OR
     IGNORE ya lo protegía de duplicar, pero re-pedir miles de timestamps
     existentes desperdicia llamadas a una API pública sin necesidad).
+
+    on_progreso (opcional): callback `f(interval, n_calls, total)` llamado
+    en cada iteración del loop — sin dependencia de Qt ni de ningún otro
+    framework, solo una función plana. Es lo que le permite a
+    escritorio/hilo_recolector.py mostrar una barra de progreso real
+    (número de descargas hechas sobre el total) en vez de un simple
+    "cargando" indeterminado; sin callback (default None) el
+    comportamiento es idéntico al de siempre.
+
+    debe_detener (opcional): callback `f() -> bool`, chequeado antes de
+    cada request — si devuelve True, corta el loop ahí mismo (con lo ya
+    descargado hasta ese punto) en vez de terminar todo `faltantes`. Sin
+    esto, pedir que el recolector se detenga mientras corre un backfill
+    largo no tenía ningún efecto hasta que ese backfill terminaba solo —
+    ver escritorio/hilo_recolector.py, que pasa `lambda: self._detener`.
 
     Devuelve (n_calls, total_filas, faltantes) — `faltantes` es la lista de
     timestamps que efectivamente hacía falta pedir, para que el llamador
@@ -253,14 +297,22 @@ def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0):
 
     n_calls = 0
     total_filas = 0
+    total = len(faltantes)
     for ts in faltantes:
+        if debe_detener is not None and debe_detener():
+            logging.info(f"Backfill de faltantes {interval}: interrumpido por pedido externo ({n_calls}/{total})")
+            break
+
         df = collect_func(db, timestamp=ts)
         n_calls += 1
         total_filas += len(df) if df is not None else 0
 
+        if on_progreso is not None:
+            on_progreso(interval, n_calls, total)
+
         if n_calls % 24 == 0:
             logging.info(
-                f"Backfill de faltantes {interval}: {n_calls}/{len(faltantes)} llamadas, "
+                f"Backfill de faltantes {interval}: {n_calls}/{total} llamadas, "
                 f"{total_filas} filas acumuladas"
             )
 
@@ -294,8 +346,20 @@ def _agrupar_en_rangos(timestamps, step):
     return rangos
 
 
-def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0):
+def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_progreso=None, debe_detener=None):
     """
+    on_progreso (opcional): callback `f(fase, actual, total)` — se pasa
+    tal cual a backfill_faltantes() (fase = el intervalo, ej. '1h') y a
+    replay_historico.ejecutar_replay() (fase = 'replay') para que
+    escritorio/hilo_recolector.py pueda mostrar una barra de progreso real
+    durante el relleno de huecos y el replay que puede disparar. Ver el
+    docstring de backfill_faltantes.
+
+    debe_detener (opcional): callback `f() -> bool`, se pasa tal cual a
+    backfill_faltantes()/ejecutar_replay() (corta cada uno a mitad de
+    camino) y además se chequea entre intervalos y entre rangos de replay,
+    para no arrancar un tramo nuevo si ya se pidió parar.
+
     Se corre una vez al arrancar el recolector: por cada intervalo en
     `intervalos`, mira desde cuándo hay datos en su tabla y rellena con
     `backfill_faltantes` todo lo que falte hasta ahora. Soluciona la
@@ -346,6 +410,10 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0):
     ahora = int(time.time())
 
     for interval in intervalos:
+        if debe_detener is not None and debe_detener():
+            logging.info("rellenar_huecos_al_inicio: interrumpido por pedido externo")
+            break
+
         tabla = TABLA_POR_INTERVALO[interval]
         _, step = INTERVALS[interval]
         ahora_alineado = ahora - (ahora % step)
@@ -378,7 +446,9 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0):
         limite_legible = datetime.fromtimestamp(limite).strftime('%Y-%m-%d %H:%M:%S')
         logging.info(f"=== Relleno de huecos al iniciar: {interval} desde {inicio_legible} hasta {limite_legible} ===")
         try:
-            _, _, faltantes = backfill_faltantes(interval, inicio, limite, db, delay=delay)
+            _, _, faltantes = backfill_faltantes(
+                interval, inicio, limite, db, delay=delay, on_progreso=on_progreso, debe_detener=debe_detener,
+            )
         except Exception as e:
             logging.error(f"Error rellenando huecos de {interval}: {e}")
             continue
@@ -389,8 +459,11 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0):
         rangos = _agrupar_en_rangos(faltantes, step)
         logging.info(f"Replay histórico: {len(rangos)} rango(s) de hueco detectado(s) en precios_1h")
         for inicio_rango, fin_rango in rangos:
+            if debe_detener is not None and debe_detener():
+                logging.info("rellenar_huecos_al_inicio: replay interrumpido por pedido externo")
+                break
             try:
-                ejecutar_replay(db, inicio_rango, fin_rango)
+                ejecutar_replay(db, inicio_rango, fin_rango, on_progreso=on_progreso, debe_detener=debe_detener)
             except Exception as e:
                 logging.error(f"Error en replay histórico del rango {inicio_rango}-{fin_rango}: {e}")
 
