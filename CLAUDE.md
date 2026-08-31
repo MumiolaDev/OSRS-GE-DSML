@@ -230,6 +230,11 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   regresor en la tabla, muestra un gráfico (`pyqtgraph`) de predicted_price vs. actual_price
   (tabla `predicciones`) para un ítem elegido del propio modelo — el clasificador no tiene
   equivalente (no persiste un precio continuo) y muestra un mensaje en vez de un gráfico vacío.
+  El walk-forward corre una vez al crear el modelo (todo el historial disponible en ese
+  momento); "Rehacer walk-forward" (cualquier tipo, regresor o clasificador) pide una ventana en
+  días y vuelve a correr `ejecutar_replay_modelo` acotado a eso — pensado para cubrir historial
+  recolectado después de la creación sin recorrer meses ya cubiertos; resumible como siempre
+  (`existe_checkpoint` saltea lo que ya corrió, no lo recalcula).
   `pagina_configuracion.py` edita el token de Telegram y la ruta de la DB, persistidos en
   `config.json` (`configuracion.py`).
 

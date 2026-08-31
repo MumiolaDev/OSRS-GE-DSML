@@ -37,6 +37,7 @@ se muestra un mensaje en vez de un gráfico vacío.
 """
 import re
 import sqlite3
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -223,6 +224,45 @@ class _DialogoNuevoModelo(QDialog):
         }
 
 
+class _DialogoVentanaWalkforward(QDialog):
+    """Pide cuántos días hacia atrás rehacer el walk-forward de un modelo
+    ya existente (ver PaginaModelos._rehacer_walkforward) -- mismo widget
+    que la ventana de historial de _DialogoNuevoModelo, pero acá NO crea
+    nada nuevo: solo recorre de nuevo los checkpoints de ese rango (o los
+    completa, si nunca corrieron -- ejecutar_replay_modelo es resumible,
+    saltea los que ya existen)."""
+    def __init__(self, dias_sugeridos, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Rehacer walk-forward")
+        self.resize(420, 180)
+
+        layout = QVBoxLayout(self)
+        aviso = QLabel(
+            "Vuelve a correr el walk-forward sobre los últimos N días -- útil para cubrir datos "
+            "recolectados después de crear el modelo (el walk-forward inicial solo cubrió el "
+            "historial disponible en ese momento). Los checkpoints que ya existen se saltean, no "
+            "se recalculan."
+        )
+        aviso.setWordWrap(True)
+        layout.addWidget(aviso)
+
+        form = QFormLayout()
+        self.campo_dias = QDoubleSpinBox()
+        self.campo_dias.setRange(0.1, 3650.0)
+        self.campo_dias.setDecimals(1)
+        self.campo_dias.setValue(dias_sugeridos)
+        form.addRow("Días hacia atrás:", self.campo_dias)
+        layout.addLayout(form)
+
+        botones = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        botones.accepted.connect(self.accept)
+        botones.rejected.connect(self.reject)
+        layout.addWidget(botones)
+
+    def dias(self):
+        return self.campo_dias.value()
+
+
 def _crear_par_modelos(db, nombre, item_ids, ventana_dias):
     """
     Crea el par regresor+clasificador de un modelo (ver
@@ -310,11 +350,13 @@ class PaginaModelos(QWidget):
         boton_nuevo.clicked.connect(self._nuevo_modelo)
         self.boton_entrenar = QPushButton("Entrenar ahora")
         self.boton_entrenar.clicked.connect(self._entrenar_seleccionado)
+        self.boton_walkforward = QPushButton("Rehacer walk-forward")
+        self.boton_walkforward.clicked.connect(self._rehacer_walkforward)
         self.boton_pausar = QPushButton("Pausar / activar")
         self.boton_pausar.clicked.connect(self._alternar_estado_seleccionado)
         self.boton_eliminar = QPushButton("Eliminar")
         self.boton_eliminar.clicked.connect(self._eliminar_seleccionado)
-        for boton in (boton_nuevo, self.boton_entrenar, self.boton_pausar, self.boton_eliminar):
+        for boton in (boton_nuevo, self.boton_entrenar, self.boton_walkforward, self.boton_pausar, self.boton_eliminar):
             fila_botones.addWidget(boton)
         fila_botones.addStretch()
         layout.addLayout(fila_botones)
@@ -507,15 +549,54 @@ class PaginaModelos(QWidget):
             self.label_estado.setText(f"'{model_id}' no se pudo entrenar todavía — {mensaje}.")
         self._refrescar()
 
-    def _encolar_walkforward(self, model_ids):
+    def _rehacer_walkforward(self):
         """
-        Agrega `model_ids` a la cola de walk-forward inicial (ver
+        Pedido explícito del usuario: el walk-forward solo corría una vez,
+        al crear el modelo -- después de eso el recolector sigue juntando
+        datos nuevos, pero ese historial nuevo nunca se cubre con
+        walk-forward (ni aparece en el gráfico de predicción vs. real) a
+        menos que se dispare de nuevo a mano. Pide una ventana en días (no
+        todo el historial de nuevo: sería recorrer meses ya cubiertos solo
+        para cubrir los últimos días) y la encola igual que el walk-forward
+        inicial -- ejecutar_replay_modelo ya es resumible, así que los
+        checkpoints que caigan dentro de la ventana pero ya existan se
+        saltean solos, no hace falta evitarlos acá.
+        """
+        cfg = self._fila_seleccionada()
+        if cfg is None:
+            QMessageBox.information(self, "Elegí un modelo", "Seleccioná una fila de la tabla primero.")
+            return
+        if self._hilo_walkforward is not None and self._hilo_walkforward.isRunning():
+            QMessageBox.information(self, "Walk-forward en curso", "Esperá a que termine el actual antes de lanzar otro.")
+            return
+
+        dialogo = _DialogoVentanaWalkforward(cfg.get('ventana_dias') or VENTANA_DIAS_DEFAULT, self)
+        if dialogo.exec() != QDialog.Accepted:
+            return
+        dias = dialogo.dias()
+        desde_ts = int(time.time() - dias * 86400)
+
+        self.label_estado.setText(
+            f"Rehaciendo walk-forward de '{cfg['nombre']}' sobre los últimos {dias:.1f} días..."
+        )
+        self._encolar_walkforward([cfg['model_id']], desde_ts=desde_ts)
+
+    def _encolar_walkforward(self, model_ids, desde_ts=None, hasta_ts=None):
+        """
+        Agrega `model_ids` a la cola de walk-forward (ver
         replay_historico.ejecutar_replay_modelo) y arranca el
         procesamiento si no hay uno corriendo ya. Se procesan de a UNO por
         vez, no en paralelo — varios fits de XGBoost compitiendo por CPU
         al mismo tiempo no aporta nada, solo hace que todos tarden más.
+
+        desde_ts/hasta_ts (opcional): mismo rango para TODOS los model_ids
+        de esta llamada — None (default) recorre todo el historial
+        disponible (el walk-forward inicial de "+ Nuevo modelo"/"+ Nuevo
+        grupo"); un rango explícito es lo que usa _rehacer_walkforward
+        (siempre llama con un solo model_id, así que no hace falta un
+        rango por ítem de la cola).
         """
-        self._cola_walkforward.extend(model_ids)
+        self._cola_walkforward.extend((model_id, desde_ts, hasta_ts) for model_id in model_ids)
         if self._hilo_walkforward is None or not self._hilo_walkforward.isRunning():
             self._procesar_siguiente_walkforward()
 
@@ -523,11 +604,11 @@ class PaginaModelos(QWidget):
         if not self._cola_walkforward:
             self.barra_walkforward.setVisible(False)
             return
-        model_id = self._cola_walkforward.pop(0)
+        model_id, desde_ts, hasta_ts = self._cola_walkforward.pop(0)
         self.barra_walkforward.setVisible(True)
         self.barra_walkforward.setRange(0, 0)  # indeterminado hasta el primer tick de progreso real
-        self.label_estado.setText(f"Walk-forward inicial de '{model_id}'...")
-        self._hilo_walkforward = HiloWalkForward(self.db_path, model_id)
+        self.label_estado.setText(f"Walk-forward de '{model_id}'...")
+        self._hilo_walkforward = HiloWalkForward(self.db_path, model_id, desde_ts=desde_ts, hasta_ts=hasta_ts)
         self._hilo_walkforward.progreso.connect(self._on_progreso_walkforward)
         self._hilo_walkforward.terminado.connect(self._on_terminado_walkforward)
         self._hilo_walkforward.start()
@@ -544,7 +625,7 @@ class PaginaModelos(QWidget):
     def _on_terminado_walkforward(self, model_id, n_corridos, n_saltados, n_fallidos):
         total = n_corridos + n_saltados + n_fallidos
         self.label_estado.setText(
-            f"Walk-forward inicial de '{model_id}' completo: {n_corridos} corridos, "
+            f"Walk-forward de '{model_id}' completo: {n_corridos} corridos, "
             f"{n_saltados} ya existentes, {n_fallidos} fallidos, de {total} checkpoints."
         )
         self._refrescar()
