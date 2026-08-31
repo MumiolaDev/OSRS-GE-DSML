@@ -24,15 +24,26 @@ la UI. Lo único configurable ahora es la ventana de historial y los
 base_de_datos.crear_modelo_config/entrenador.py hayan perdido esa
 flexibilidad (siguen aceptando tipo/cadencia/tabla arbitrarios, nada de
 eso se tocó), sino porque esta pantalla ya no la expone.
+
+Al seleccionar un modelo de tipo='regresor' en la tabla (pedido explícito
+del usuario: "un gráfico del regresor sobre lo real"), se muestra un
+gráfico de predicted_price vs. actual_price (tabla `predicciones`) para un
+ítem elegido del propio modelo — prioriza modo_evaluacion='walkforward'
+sobre 'holdout' (mismo criterio que _resumen_calidad: hay datos apenas
+termina el walk-forward inicial, sin esperar a un reentrenamiento en vivo).
+El clasificador no tiene un gráfico equivalente (no persiste
+predicted_price continuo, ver el bullet de entrenador.py en CLAUDE.md) —
+se muestra un mensaje en vez de un gráfico vacío.
 """
 import re
 import sqlite3
 from datetime import datetime
 
 import pandas as pd
+import pyqtgraph as pg
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
+    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
     QTableView, QVBoxLayout, QWidget,
 )
 
@@ -244,6 +255,43 @@ def _crear_par_modelos(db, nombre, item_ids, ventana_dias):
     return creados, errores
 
 
+def _nombres_items(db, item_ids):
+    """dict {item_id: name} para mostrar en el selector de ítems del
+    gráfico -- no usa SelectorItems (widget de búsqueda pensado para
+    ELEGIR ítems nuevos) porque acá el conjunto ya es fijo (los del
+    modelo), solo hace falta el nombre para mostrarlo."""
+    if not item_ids:
+        return {}
+    conn = sqlite3.connect(db.db_path)
+    placeholders = ','.join('?' * len(item_ids))
+    df = pd.read_sql_query(
+        f'SELECT item_id, name FROM items WHERE item_id IN ({placeholders})', conn, params=item_ids,
+    )
+    conn.close()
+    return dict(zip(df['item_id'], df['name']))
+
+
+def _predicciones_item(db, model_id, item_id):
+    """predicted_price/actual_price (tabla `predicciones`) de un ítem para
+    un modelo, ordenado por tiempo -- prioriza modo_evaluacion='walkforward'
+    sobre 'holdout' cuando hay de los dos (mismo criterio que
+    _resumen_calidad): el walk-forward inicial deja datos apenas se crea el
+    modelo, sin esperar a un reentrenamiento en vivo, y cubre mucha más
+    historia que un solo split holdout. DataFrame vacío si no hay ninguno
+    todavía."""
+    conn = sqlite3.connect(db.db_path)
+    df = pd.read_sql_query(
+        "SELECT timestamp, predicted_price, actual_price, modo_evaluacion FROM predicciones "
+        "WHERE item_id = ? AND model_version = ? ORDER BY timestamp",
+        conn, params=(item_id, model_id),
+    )
+    conn.close()
+    if df.empty:
+        return df
+    modo = 'walkforward' if (df['modo_evaluacion'] == 'walkforward').any() else 'holdout'
+    return df[df['modo_evaluacion'] == modo].drop(columns='modo_evaluacion').reset_index(drop=True)
+
+
 class PaginaModelos(QWidget):
     def __init__(self, db, db_path, parent=None):
         super().__init__(parent)
@@ -253,6 +301,7 @@ class PaginaModelos(QWidget):
         self._hilo_entrenamiento = None
         self._hilo_walkforward = None
         self._cola_walkforward = []  # model_id pendientes, se procesan de a uno
+        self._model_id_grafico = None  # model_id del regresor seleccionado, o None
 
         layout = QVBoxLayout(self)
 
@@ -281,7 +330,30 @@ class PaginaModelos(QWidget):
         self.tabla, self.modelo_tabla = crear_tabla(columnas=COLUMNAS_TABLA)
         self.tabla.setSelectionMode(QTableView.SingleSelection)
         self.tabla.setSelectionBehavior(QTableView.SelectRows)
+        self.tabla.selectionModel().selectionChanged.connect(self._on_seleccion_cambiada)
         layout.addWidget(self.tabla)
+
+        # Gráfico de predicted_price vs. actual_price del regresor
+        # seleccionado (pedido explícito del usuario) -- ver el docstring
+        # del módulo y _actualizar_grafico.
+        grupo_grafico = QGroupBox("Predicción vs. precio real (regresor)")
+        layout_grafico = QVBoxLayout(grupo_grafico)
+        self.combo_item_grafico = QComboBox()
+        self.combo_item_grafico.setVisible(False)
+        self.combo_item_grafico.currentIndexChanged.connect(self._actualizar_grafico)
+        layout_grafico.addWidget(self.combo_item_grafico)
+        self.label_grafico_vacio = QLabel("Seleccioná un modelo de la tabla para ver su gráfico.")
+        self.label_grafico_vacio.setWordWrap(True)
+        layout_grafico.addWidget(self.label_grafico_vacio)
+        self.grafico = pg.PlotWidget(axisItems={'bottom': pg.DateAxisItem()})
+        self.grafico.setBackground('w')
+        self.grafico.setLabel('left', 'Precio (gp)')
+        self.grafico.showGrid(x=True, y=True, alpha=0.3)
+        self._leyenda_grafico = self.grafico.addLegend()
+        self.grafico.setMinimumHeight(200)
+        self.grafico.setVisible(False)
+        layout_grafico.addWidget(self.grafico)
+        layout.addWidget(grupo_grafico)
 
         self._refrescar()
 
@@ -294,6 +366,7 @@ class PaginaModelos(QWidget):
         arriba (podría interrumpir un click del usuario sin explicación).
         """
         try:
+            model_id_previo = self._model_id_grafico  # ver más abajo: reset_model pierde la selección
             self._modelos = self.db.listar_modelos_config()
             filas = [
                 {
@@ -305,6 +378,17 @@ class PaginaModelos(QWidget):
                 for cfg in self._modelos
             ]
             self.modelo_tabla.set_dataframe(pd.DataFrame(filas))
+            # set_dataframe hace beginResetModel/endResetModel, que reinicia
+            # la selección de la tabla -- sin esto, terminar un entrenamiento
+            # o un walk-forward (que llaman _refrescar) haría desaparecer el
+            # gráfico que el usuario ya tenía abierto, por más que el modelo
+            # siga existiendo. Si ya no existe (se eliminó), selectRow no
+            # encuentra nada y _on_seleccion_cambiada cae al estado vacío.
+            if model_id_previo is not None:
+                for fila, cfg in enumerate(self._modelos):
+                    if cfg['model_id'] == model_id_previo:
+                        self.tabla.selectRow(fila)
+                        break
         except Exception as e:
             self.label_estado.setText(f"No se pudo actualizar la lista de modelos: {e}")
 
@@ -314,6 +398,66 @@ class PaginaModelos(QWidget):
             return None
         fila = indices[0].row()
         return self._modelos[fila] if 0 <= fila < len(self._modelos) else None
+
+    def _on_seleccion_cambiada(self, *_):
+        """Repuebla el selector de ítems del gráfico según el modelo
+        recién seleccionado -- ver _actualizar_grafico para el gráfico en
+        sí. *_ absorbe (QItemSelection seleccionado, QItemSelection
+        deseleccionado) de la señal selectionChanged, no se usan."""
+        cfg = self._fila_seleccionada()
+        self.combo_item_grafico.blockSignals(True)
+        self.combo_item_grafico.clear()
+        if cfg is None:
+            self._model_id_grafico = None
+            self.label_grafico_vacio.setText("Seleccioná un modelo de la tabla para ver su gráfico.")
+        elif cfg['tipo'] != 'regresor':
+            self._model_id_grafico = None
+            self.label_grafico_vacio.setText(
+                "El clasificador no tiene un gráfico continuo (no predice un precio, sino "
+                "sube/estable/baja) — elegí el regresor del par, mismo nombre con "
+                "\"(regresor)\", para ver esto."
+            )
+        else:
+            self._model_id_grafico = cfg['model_id']
+            item_ids = cfg['item_ids'] or []
+            nombres = _nombres_items(self.db, item_ids)
+            for item_id in item_ids:
+                self.combo_item_grafico.addItem(nombres.get(item_id) or f"(ítem {item_id})", item_id)
+            if not item_ids:
+                self.label_grafico_vacio.setText("Este modelo no tiene ítems configurados.")
+        self.combo_item_grafico.setVisible(self.combo_item_grafico.count() > 0)
+        self.combo_item_grafico.blockSignals(False)
+        self._actualizar_grafico()
+
+    def _actualizar_grafico(self):
+        """Dibuja predicted_price/actual_price del ítem elegido en
+        combo_item_grafico para self._model_id_grafico — ver
+        _predicciones_item. No hace nada si no hay modelo/ítem
+        seleccionado (self.grafico ya queda oculto por
+        _on_seleccion_cambiada en ese caso)."""
+        self.grafico.clear()
+        self._leyenda_grafico.clear()
+        if self._model_id_grafico is None or self.combo_item_grafico.count() == 0:
+            self.grafico.setVisible(False)
+            self.label_grafico_vacio.setVisible(True)
+            return
+
+        item_id = self.combo_item_grafico.currentData()
+        df = _predicciones_item(self.db, self._model_id_grafico, item_id)
+        if df.empty:
+            self.grafico.setVisible(False)
+            self.label_grafico_vacio.setText(
+                "Sin predicciones todavía para este ítem — esperá a que termine el walk-forward "
+                "inicial, o probá \"Entrenar ahora\"."
+            )
+            self.label_grafico_vacio.setVisible(True)
+            return
+
+        self.label_grafico_vacio.setVisible(False)
+        self.grafico.setVisible(True)
+        x = df['timestamp'].to_numpy(dtype=float)
+        self.grafico.plot(x, df['actual_price'].to_numpy(dtype=float), pen=pg.mkPen('#1f77b4', width=2), name='Real')
+        self.grafico.plot(x, df['predicted_price'].to_numpy(dtype=float), pen=pg.mkPen('#d62728', width=2), name='Predicho')
 
     def _nuevo_modelo(self):
         dialogo = _DialogoNuevoModelo(self.db_path, self)

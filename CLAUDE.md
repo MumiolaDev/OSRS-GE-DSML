@@ -226,8 +226,12 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   "+ Nuevo modelo" crea siempre un par regresor+clasificador (cadencia horaria, tabla
   precios_1h) sobre los ítems que el usuario elija, con la ventana de historial como único otro
   parámetro configurable — no hay ningún modelo protegido contra borrado, todos son del usuario
-  (ver el bullet de `base_de_datos.py`: `modelos_config` arranca vacía). `pagina_configuracion.py`
-  edita el token de Telegram y la ruta de la DB, persistidos en `config.json` (`configuracion.py`).
+  (ver el bullet de `base_de_datos.py`: `modelos_config` arranca vacía). Al seleccionar un
+  regresor en la tabla, muestra un gráfico (`pyqtgraph`) de predicted_price vs. actual_price
+  (tabla `predicciones`) para un ítem elegido del propio modelo — el clasificador no tiene
+  equivalente (no persiste un precio continuo) y muestra un mensaje en vez de un gráfico vacío.
+  `pagina_configuracion.py` edita el token de Telegram y la ruta de la DB, persistidos en
+  `config.json` (`configuracion.py`).
 
 ## Convenciones del código
 
