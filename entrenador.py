@@ -12,46 +12,34 @@ from preprocesamiento import build_training_set
 
 MODEL_DIR = "models"
 
-# Dos modelos, misma arquitectura y código de entrenamiento, distinta
-# cadencia de reentrenamiento (ver recolector.py job_horario/job_diario):
-# 'global_horario' es la señal rápida que consumen las alertas casi en
-# tiempo real, 'global_diario' es la referencia estable de calidad de largo
-# plazo. model_metrics.model_name y predicciones.model_version ya soportan
-# taggear ambos sin pisarse, así que no hace falta tocar el esquema para
-# esto — solo dejar de usar una constante fija (MODEL_VERSION) y parametrizar.
+# Nombres de referencia para model_name/model_version (model_metrics.model_name
+# y predicciones.model_version ya soportan taggear cualquier cantidad de
+# variantes sin pisarse) — NO son modelos sembrados por default: no hay
+# ningún modelo hasta que el usuario cree uno desde "Mis modelos" en la app
+# de escritorio (ver escritorio/paginas/pagina_modelos.py, que hoy crea
+# siempre un par regresor+clasificador con cadencia horaria y tabla
+# precios_1h). Estos nombres solo importan si el usuario elige exactamente
+# uno de ellos (o si un modelo apunta a la ruta fija de MODEL_PATHS más
+# abajo) — el resto del pipeline (job_horario/job_diario, dashboard.py) es
+# genérico sobre cualquier model_name.
 MODEL_NAME_HORARIO = "global_horario"
 MODEL_NAME_DIARIO = "global_diario"
 
-# Clasificador direccional (entrenar_clasificador_direccional): declarado acá
-# arriba, antes de MODEL_PATHS, porque las variantes productivas necesitan
-# una entrada en ese dict. global_horario_clasif (200 ítems F2P+members)
-# sigue siendo solo un experimento de comparación en model_metrics — no
-# tiene .pkl, no lo busques en MODEL_PATHS. f2p10_clasif (10 ítems F2P sin
-# filtro de precio) fue la primera variante promovida a producción, pero
-# quedó reemplazada por f2p10_100gp_clasif (mismos 10 ítems, pero con
-# precio_minimo=100 y Steel bar excluido) tras el backtest walk-forward de
-# 90 días: sin el filtro de precio la señal empataba con comprar a ciegas
-# (ver backtest.simular_clasificador_walkforward); con el filtro, la señal
-# convierte una estrategia perdedora (-67.6M gp comprando a ciegas en el
-# mismo rango) en ganadora (+7.3M gp). f2p10_clasif ya no se reentrena
-# desde recolector.job_horario, pero se deja el nombre/.pkl viejo sin
-# borrar (no rompe nada, solo queda desactualizado). Nombres distintos
-# para no pisarse en model_metrics (INSERT OR REPLACE por
-# model_name+train_timestamp).
-#
-# excluir_item_ids de modelos_config.f2p10_100gp_clasif (ver
-# base_de_datos._sembrar_modelos_productivos) creció de [2353] a
-# [2353, 449, 453]: un test de significancia por permutación sobre 90 días/
-# 5.639 trades (walk-forward real, universo exacto de producción — ya
-# borrado, ver el commit que agregó/quitó busqueda_significancia.py) mostró
-# que el modelo gana significativamente más que el azar en conjunto
-# (p=0.002), pero Coal (453, 22.9% win rate — peor que el 35.5% del propio
-# azar) y Adamantite ore (449, 34.2%) restaban plata de forma consistente,
-# no por mala suerte puntual — mismo criterio que ya había excluido Steel
-# bar. La ganancia real está muy concentrada en Cosmic rune (item_id 564,
-# 91% del total, estable en las dos mitades de la ventana); el resto del
-# universo aporta una señal débil, casi indistinguible del azar por sí
-# sola.
+# Nombres de referencia para el clasificador direccional
+# (entrenar_clasificador_direccional) — mismo criterio que arriba, ninguno
+# sembrado por default. f2p10_100gp_clasif es el nombre usado en la
+# investigación de calidad de modelos de 2026-08-30/31 (10 ítems F2P más
+# líquidos, precio_minimo=100, excluir_item_ids=[2353, 449, 453] — Steel
+# bar, Adamantite ore, Coal): un test de significancia por permutación
+# sobre 90 días/5.639 trades mostró que esa configuración gana
+# significativamente más que el azar (p=0.002) comprando/vendiendo a 1h,
+# pero con la ganancia muy concentrada en un solo ítem (Cosmic rune, 91%
+# del total) y con Coal/Adamantite ore restando plata de forma consistente
+# (por eso están excluidos) — si se recrea un modelo así desde la app, ese
+# es el criterio de selección validado, aunque hoy la app solo permite
+# elegir ítems a mano (modo_seleccion='liquidez' no está expuesto en la UI,
+# ver pagina_modelos.py), así que replicarlo exacto requiere pasar esos
+# mismos parámetros vía crear_modelo_config directamente, no desde la UI.
 MODEL_NAME_CLASIFICADOR = "global_horario_clasif"
 MODEL_NAME_CLASIF_F2P = "f2p10_clasif"
 MODEL_NAME_CLASIF_F2P_100GP = "f2p10_100gp_clasif"

@@ -191,9 +191,10 @@ def ejecutar_replay_clasificador(
     granularidad y ventana de historial configurables. Los tres son lo que
     le permite a esta función (antes atada a la liquidez sobre
     precios_1h con todo el historial) usarse para un grupo de ítems
-    puntual con su propia configuración (ej. un ambiente de testeo con
-    ítems elegidos a mano y una ventana acotada, ver
-    docs/investigacion_calidad_modelos.md para el criterio).
+    puntual con su propia configuración, ej. un modelo definido por el
+    usuario desde la app de escritorio (ítems elegidos a mano y una
+    ventana acotada, ver escritorio/paginas/pagina_modelos.py) o un
+    ambiente de testeo ad hoc.
 
     on_progreso/debe_detener: mismo patrón que replay_historico.
     ejecutar_replay/ejecutar_replay_modelo — callback f(fase, actual,
