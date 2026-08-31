@@ -56,10 +56,12 @@ VENTANA_DIAS_DEFAULT = 90.0
 # distinguir "modelos del sistema" de "modelos del usuario": todos son del
 # usuario, y cualquier fila de la tabla se puede eliminar desde acá.
 
+# Sin columnas de 'tipo'/'cadencia' (pedido explícito del usuario: no
+# aportan nada ahora que son valores fijos para todo lo creado desde acá
+# -- cadencia siempre 'horaria', y tipo ya se distingue en el propio
+# nombre, "... (regresor)"/"... (clasificador)", ver _crear_par_modelos).
 COLUMNAS_TABLA = [
     ('nombre', 'Nombre'),
-    ('tipo', 'Tipo'),
-    ('cadencia', 'Cadencia'),
     ('estado', 'Estado'),
     ('calidad', 'Calidad'),
     ('ultimo_entrenamiento', 'Último entrenamiento'),
@@ -296,8 +298,6 @@ class PaginaModelos(QWidget):
             filas = [
                 {
                     'nombre': cfg['nombre'],
-                    'tipo': 'Regresor' if cfg['tipo'] == 'regresor' else 'Clasificador',
-                    'cadencia': cfg['cadencia'].capitalize(),
                     'estado': 'Activo' if cfg['estado'] == 'activo' else 'Pausado',
                     'calidad': _resumen_calidad(self.db, cfg['model_id']),
                     'ultimo_entrenamiento': _formatear_fecha(cfg['ultimo_entrenamiento_ts']),
