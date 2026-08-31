@@ -25,6 +25,7 @@ mayores), así que no hay loop ni filas sintéticas.
 """
 
 import logging
+import os
 import sqlite3
 
 import joblib
@@ -47,14 +48,29 @@ def cargar_modelo(model_name=None, model_path=None):
     que se usó al entrenar — ver el comentario en entrenador.py sobre por
     qué esto es imprescindible con XGBoost + enable_categorical.
 
-    Se puede pedir por `model_name` ('global_horario' o 'global_diario',
-    ver entrenador.MODEL_PATHS) o por `model_path` directo. Sin ninguno de
-    los dos, carga 'global_horario' — el modelo de cadencia rápida, el que
-    consumen las alertas casi en tiempo real (alertas.py).
+    Se puede pedir por `model_name` (cualquier model_id de modelos_config,
+    no solo 'global_horario'/'global_diario' — ver más abajo) o por
+    `model_path` directo. Sin ninguno de los dos, carga 'global_horario'
+    — el modelo de cadencia rápida, el que consumen las alertas casi en
+    tiempo real (alertas.py).
+
+    Resuelve la ruta con el mismo criterio que el lado que GUARDA el
+    bundle (entrenador.entrenar_modelo_global/entrenar_clasificador_direccional):
+    entrenador.MODEL_PATHS.get(model_name, .../f"model_{model_name}.pkl")
+    — antes esto indexaba MODEL_PATHS directo (`MODEL_PATHS[model_name]`),
+    que solo tiene 4 entradas fijas (los 2 regresores + 2 variantes del
+    clasificador F2P); cualquier modelo creado por el usuario desde la app
+    de escritorio (ver escritorio/paginas/pagina_modelos.py) SÍ se guarda
+    bien (ese lado ya usaba `.get()` con fallback), pero cargar_modelo
+    tiraba KeyError al intentar leerlo de vuelta — bug real, encontrado
+    revisando pagina_oportunidades.py ("no se pudo cargar el modelo
+    'custom_...'": ese `str(KeyError(...))` es justo el nombre del modelo
+    entre comillas, no un mensaje de "no entrenado todavía").
     """
     if model_path is None:
-        from entrenador import MODEL_NAME_HORARIO, MODEL_PATHS
-        model_path = MODEL_PATHS[model_name or MODEL_NAME_HORARIO]
+        from entrenador import MODEL_NAME_HORARIO, MODEL_PATHS, MODEL_DIR
+        nombre = model_name or MODEL_NAME_HORARIO
+        model_path = MODEL_PATHS.get(nombre, os.path.join(MODEL_DIR, f"model_{nombre}.pkl"))
     return joblib.load(model_path)
 
 
