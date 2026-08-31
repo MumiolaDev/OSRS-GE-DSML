@@ -344,7 +344,10 @@ class OSRSBaseDatos:
         Los parámetros de selección de ítems (n_items/solo_f2p/
         precio_minimo/excluir_item_ids) son exactamente los que ya usaba
         recolector.job_horario antes de esta tabla — ver su código en la
-        rama previa a app-escritorio-v1, o entrenador.py.
+        rama previa a app-escritorio-v1, o entrenador.py. excluir_item_ids
+        de f2p10_100gp_clasif es [2353, 449, 453] (Steel bar, Adamantite
+        ore, Coal) — ver el comentario junto a MODEL_NAME_CLASIF_F2P_100GP
+        en entrenador.py para el porqué de cada uno.
         """
         import json
 
@@ -363,7 +366,7 @@ class OSRSBaseDatos:
             ),
             (
                 'f2p10_100gp_clasif', 'Clasificador F2P (10 ítems, ≥100gp)', 'clasificador', 'liquidez',
-                None, 10, 1, 100, json.dumps([2353]), 5, '[3, 6]', 1, 0.5, 'horaria', 'activo', ahora, None,
+                None, 10, 1, 100, json.dumps([2353, 449, 453]), 5, '[3, 6]', 1, 0.5, 'horaria', 'activo', ahora, None,
                 'precios_1h', None,
             ),
         ]

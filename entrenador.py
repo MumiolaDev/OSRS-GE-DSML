@@ -38,6 +38,20 @@ MODEL_NAME_DIARIO = "global_diario"
 # borrar (no rompe nada, solo queda desactualizado). Nombres distintos
 # para no pisarse en model_metrics (INSERT OR REPLACE por
 # model_name+train_timestamp).
+#
+# excluir_item_ids de modelos_config.f2p10_100gp_clasif (ver
+# base_de_datos._sembrar_modelos_productivos) creció de [2353] a
+# [2353, 449, 453]: un test de significancia por permutación sobre 90 días/
+# 5.639 trades (walk-forward real, universo exacto de producción — ya
+# borrado, ver el commit que agregó/quitó busqueda_significancia.py) mostró
+# que el modelo gana significativamente más que el azar en conjunto
+# (p=0.002), pero Coal (453, 22.9% win rate — peor que el 35.5% del propio
+# azar) y Adamantite ore (449, 34.2%) restaban plata de forma consistente,
+# no por mala suerte puntual — mismo criterio que ya había excluido Steel
+# bar. La ganancia real está muy concentrada en Cosmic rune (item_id 564,
+# 91% del total, estable en las dos mitades de la ventana); el resto del
+# universo aporta una señal débil, casi indistinguible del azar por sí
+# sola.
 MODEL_NAME_CLASIFICADOR = "global_horario_clasif"
 MODEL_NAME_CLASIF_F2P = "f2p10_clasif"
 MODEL_NAME_CLASIF_F2P_100GP = "f2p10_100gp_clasif"

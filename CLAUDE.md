@@ -125,12 +125,18 @@ dashboard.py (Streamlit) lee resumen_actual / model_metrics / predicciones — s
   walk-forward, no solo un split), aunque esa métrica sola no garantiza ganancia real: hace
   falta el backtest de PnL (`backtest.simular_clasificador_walkforward`) para confirmarlo —
   ver el bullet de `backtest.py`. Producción usa `solo_f2p=True, n_items=10,
-  precio_minimo=100, excluir_item_ids=[2353]` (Steel bar) —
+  precio_minimo=100, excluir_item_ids=[2353, 449, 453]` (Steel bar, Adamantite ore, Coal) —
   `MODEL_NAME_CLASIF_F2P_100GP="f2p10_100gp_clasif"` — tras un backtest walk-forward de 90
   días que mostró que sin el filtro de precio la señal empataba con comprar a ciegas (ambos
   ítems baratos y caros mezclados), mientras que con `precio_minimo=100` convierte una
   estrategia perdedora (-67.6M gp comprando a ciegas en el mismo rango) en ganadora (+7.3M
   gp) — Steel bar se excluyó puntualmente porque perdía plata con las dos estrategias.
+  Adamantite ore y Coal se sumaron después de un test de significancia por permutación
+  sobre 90 días/5.639 trades (universo exacto de producción, no ítems elegidos a mano): el
+  conjunto gana significativamente más que el azar (p=0.002), pero esos dos restaban plata
+  de forma consistente (Coal: 22.9% win rate, peor que el 35.5% del propio azar) — casi
+  toda la ganancia real está concentrada en Cosmic rune (91% del total, estable en el
+  tiempo), el resto del universo aporta una señal débil, casi indistinguible del azar.
   `job_horario` (`recolector.py`) la reentrena y persiste un `.pkl` cada hora
   (`guardar_en_disco=True`, entrada propia en `MODEL_PATHS`), y el dashboard la muestra en el
   tab "Señal direccional (F2P)" vía `prediccion.pronosticar_clase_item()` (inferencia en vivo
