@@ -191,8 +191,9 @@ def ejecutar_replay_clasificador(
     granularidad y ventana de historial configurables. Los tres son lo que
     le permite a esta función (antes atada a la liquidez sobre
     precios_1h con todo el historial) usarse para un grupo de ítems
-    puntual con su propia configuración, ej. desde
-    busqueda_hiperparametros.py.
+    puntual con su propia configuración (ej. un ambiente de testeo con
+    ítems elegidos a mano y una ventana acotada, ver
+    docs/investigacion_calidad_modelos.md para el criterio).
 
     on_progreso/debe_detener: mismo patrón que replay_historico.
     ejecutar_replay/ejecutar_replay_modelo — callback f(fase, actual,
@@ -300,9 +301,9 @@ def ejecutar_replay_modelo(db, model_id, desde_ts=None, hasta_ts=None, on_progre
     — sin esto, el walk-forward siempre recorre TODO lo que haya (el
     comportamiento pensado para "walk-forward inicial al crear un
     modelo", ver escritorio/hilo_walkforward.py). Pasar un rango explícito
-    es lo que le permite a busqueda_hiperparametros.py acotar cada prueba
-    a la ventana del backtest (ej. las últimas 2 semanas) en vez de
-    recorrer meses de historial de más que después ni siquiera se usan
+    es lo que le permite a un ambiente de testeo acotar cada prueba a la
+    ventana del backtest (ej. 90 días) en vez de recorrer meses de historial
+    de más que después ni siquiera se usan
     para el backtest — sin esto, cada prueba de la búsqueda tardaría
     varias veces más de lo necesario.
 
