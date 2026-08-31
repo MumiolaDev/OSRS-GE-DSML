@@ -11,6 +11,19 @@ evaluación, sin tabla de MAE/RMSE cruda — el estado de calidad de cada
 modelo se resume en una frase corta (_resumen_calidad), y los parámetros
 técnicos (lags, medias móviles, umbral del clasificador) no se exponen en
 el formulario de alta, quedan en los defaults sensatos de entrenador.py.
+
+Revertido a un flujo único y más simple (pedido explícito del usuario tras
+la ronda de validación de calidad de modelos — ver
+docs/investigacion_calidad_modelos.md): "+ Nuevo modelo" crea SIEMPRE un
+par (un regresor + un clasificador) sobre los mismos ítems, cadencia
+horaria, tabla precios_1h — la única granularidad que se validó con rigor.
+Antes existía también "+ Nuevo grupo" (regresor+clasificador × 3
+granularidades, 6 modelos) y un selector de tipo/cadencia en el alta
+simple; se sacaron de la UI. Lo único configurable ahora es la ventana de
+historial y los ítems — el resto queda fijo en `_crear_par_modelos`, no
+porque base_de_datos.crear_modelo_config/entrenador.py hayan perdido esa
+flexibilidad (siguen aceptando tipo/cadencia/tabla arbitrarios, nada de
+eso se tocó), sino porque esta pantalla ya no la expone.
 """
 import re
 import sqlite3
@@ -18,7 +31,7 @@ from datetime import datetime
 
 import pandas as pd
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
     QTableView, QVBoxLayout, QWidget,
 )
@@ -30,19 +43,14 @@ from escritorio.hilo_walkforward import HiloWalkForward
 from escritorio.widgets.selector_items import SelectorItems
 from escritorio.widgets.tabla_dataframe import crear_tabla
 
-# (tabla, etiqueta, ventana_dias sugerida por default) para el diálogo de
-# grupo -- 90d en 1h coincide con la retención real de precios_1h (ver
-# mantenimiento.RETENCION_DIAS), 30d en 6h y 1d en 5m son puntos de
-# partida razonables, no valores validados; el usuario los puede cambiar.
-# 5m con una ventana muy corta (ej. 1 día = 288 filas) da un dataset chico
-# -- el modelo de esa granularidad va a ser el menos confiable de los 3,
-# no hay forma de evitarlo sin alargar la ventana.
-GRANULARIDADES = [
-    ('precios_5m', '5 minutos', 1.0),
-    ('precios_1h', '1 hora', 90.0),
-    ('precios_6h', '6 horas', 30.0),
-]
-SUFIJO_GRANULARIDAD = {'precios_5m': '5m', 'precios_1h': '1h', 'precios_6h': '6h'}
+# Fijo para todo modelo creado desde acá -- ver el docstring del módulo.
+# 90d en 1h coincide con la retención real de precios_1h (ver
+# mantenimiento.RETENCION_DIAS) y con la ventana validada en la ronda de
+# significancia estadística (docs/investigacion_calidad_modelos.md), no es
+# un número arbitrario.
+TABLA_FIJA = 'precios_1h'
+CADENCIA_FIJA = 'horaria'
+VENTANA_DIAS_DEFAULT = 90.0
 
 # Los 3 modelos productivos del proyecto (sembrados en la migración, ver
 # base_de_datos._sembrar_modelos_productivos) no se pueden eliminar desde
@@ -121,54 +129,67 @@ def _formatear_fecha(ts):
     return "Nunca" if ts is None else datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
 
 
-def _generar_model_id(db, nombre):
+def _generar_ids_par(db, nombre):
     """
-    Slug legible a partir del nombre elegido por el usuario, con un
-    sufijo numérico si ya existe -- model_id es el mismo string que
+    Slugs 'model_id_regresor'/'model_id_clasificador' a partir del nombre
+    elegido por el usuario, con un sufijo numérico compartido si ya
+    existe alguno de los dos -- model_id es el mismo string que
     entrenador.py usa como model_name/model_version en todo el resto del
     pipeline (ver base_de_datos.crear_modelo_config), así que tiene que
     ser único. Prefijo 'custom_' para no poder chocar nunca con los 3
-    model_id productivos reservados (MODELOS_PROTEGIDOS).
+    model_id productivos reservados (MODELOS_PROTEGIDOS). Devuelve
+    (id_regresor, id_clasificador), siempre con el mismo sufijo -- así
+    quedan visiblemente emparejados en la tabla ("mi_modelo_regresor" /
+    "mi_modelo_clasificador"), no con sufijos independientes por tipo.
     """
     base = 'custom_' + re.sub(r'[^a-z0-9]+', '_', nombre.strip().lower()).strip('_')
     if base == 'custom_':
         base = 'custom_modelo'
-    candidato = base
-    sufijo = 1
-    while db.obtener_modelo_config(candidato) is not None:
+    sufijo = 0
+    while True:
+        candidato = base if sufijo == 0 else f"{base}_{sufijo}"
+        id_regresor, id_clasificador = f"{candidato}_regresor", f"{candidato}_clasificador"
+        if db.obtener_modelo_config(id_regresor) is None and db.obtener_modelo_config(id_clasificador) is None:
+            return id_regresor, id_clasificador
         sufijo += 1
-        candidato = f"{base}_{sufijo}"
-    return candidato
 
 
 class _DialogoNuevoModelo(QDialog):
+    """
+    Único diálogo de alta: nombre, ítems y ventana de historial son lo
+    único configurable (ver el docstring del módulo) -- tipo, cadencia y
+    tabla quedan fijos (regresor + clasificador, horaria, precios_1h) y no
+    se muestran acá.
+    """
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Nuevo modelo")
-        self.resize(480, 520)
+        self.resize(480, 560)
 
         layout = QVBoxLayout(self)
+        aviso = QLabel(
+            "Crea un par de modelos (un regresor + un clasificador) sobre los ítems elegidos, "
+            "reentrenados cada hora sobre precios de 1h. Elegí un nombre, los ítems y la ventana "
+            "de historial a usar."
+        )
+        aviso.setWordWrap(True)
+        layout.addWidget(aviso)
 
         layout.addWidget(QLabel("Nombre:"))
         self.campo_nombre = QLineEdit()
         layout.addWidget(self.campo_nombre)
 
-        layout.addWidget(QLabel("Tipo:"))
-        self.combo_tipo = QComboBox()
-        self.combo_tipo.addItem("Regresor (predice el precio)", 'regresor')
-        self.combo_tipo.addItem("Clasificador (predice si sube, baja o queda estable)", 'clasificador')
-        layout.addWidget(self.combo_tipo)
-
         layout.addWidget(QLabel(f"Ítems (máximo {MAX_ITEMS_POR_MODELO}):"))
         self.selector = SelectorItems(db_path, max_seleccion=MAX_ITEMS_POR_MODELO)
         layout.addWidget(self.selector, stretch=1)
 
-        layout.addWidget(QLabel("Cadencia:"))
-        self.combo_cadencia = QComboBox()
-        self.combo_cadencia.addItem("Horaria (se reentrena cada hora)", 'horaria')
-        self.combo_cadencia.addItem("Diaria (se reentrena una vez al día)", 'diaria')
-        self.combo_cadencia.addItem("Manual (solo cuando yo lo pida)", 'manual')
-        layout.addWidget(self.combo_cadencia)
+        form = QFormLayout()
+        self.campo_ventana = QDoubleSpinBox()
+        self.campo_ventana.setRange(0.1, 365.0)
+        self.campo_ventana.setDecimals(1)
+        self.campo_ventana.setValue(VENTANA_DIAS_DEFAULT)
+        form.addRow("Ventana de historial (días):", self.campo_ventana)
+        layout.addLayout(form)
 
         botones = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         botones.accepted.connect(self._validar_y_aceptar)
@@ -187,108 +208,40 @@ class _DialogoNuevoModelo(QDialog):
     def valores(self):
         return {
             'nombre': self.campo_nombre.text().strip(),
-            'tipo': self.combo_tipo.currentData(),
             'item_ids': self.selector.seleccionados(),
-            'cadencia': self.combo_cadencia.currentData(),
+            'ventana_dias': self.campo_ventana.value(),
         }
 
 
-class _DialogoNuevoGrupo(QDialog):
+def _crear_par_modelos(db, nombre, item_ids, ventana_dias):
     """
-    Crea, de una sola vez, un regresor + un clasificador para cada una de
-    las 3 granularidades (5m/1h/6h) sobre el mismo grupo de ítems -- el
-    flujo que pidió el usuario ("el par de runas cosmic y nature"): 6
-    modelos en total, cadencia 'manual' por default (crear un grupo ya usa
-    6 modelos; si fueran horaria/diaria un solo grupo casi agotaría
-    MAX_MODELOS_ACTIVOS) — cada uno arranca su walk-forward inicial apenas
-    se crea (ver PaginaModelos._encolar_walkforward).
-    """
-    def __init__(self, db_path, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Nuevo grupo de ítems relacionados")
-        self.resize(520, 600)
-
-        layout = QVBoxLayout(self)
-        aviso = QLabel(
-            "Elegí un grupo de ítems relacionados (ej. Nature rune + Cosmic rune) — se crean 6 "
-            "modelos (regresor + clasificador para 5 minutos, 1 hora y 6 horas), cada uno con su "
-            "propia ventana de historial. Todos arrancan con cadencia manual y un walk-forward "
-            "inicial sobre los datos ya disponibles."
-        )
-        aviso.setWordWrap(True)
-        layout.addWidget(aviso)
-
-        layout.addWidget(QLabel("Nombre del grupo:"))
-        self.campo_nombre = QLineEdit()
-        layout.addWidget(self.campo_nombre)
-
-        layout.addWidget(QLabel(f"Ítems (máximo {MAX_ITEMS_POR_MODELO}):"))
-        self.selector = SelectorItems(db_path, max_seleccion=MAX_ITEMS_POR_MODELO)
-        layout.addWidget(self.selector, stretch=1)
-
-        layout.addWidget(QLabel("Ventana de historial por granularidad (días):"))
-        form = QFormLayout()
-        self.campos_ventana = {}
-        for tabla, etiqueta, default in GRANULARIDADES:
-            spin = QDoubleSpinBox()
-            spin.setRange(0.1, 365.0)
-            spin.setDecimals(1)
-            spin.setValue(default)
-            form.addRow(f"{etiqueta}:", spin)
-            self.campos_ventana[tabla] = spin
-        layout.addLayout(form)
-
-        botones = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        botones.accepted.connect(self._validar_y_aceptar)
-        botones.rejected.connect(self.reject)
-        layout.addWidget(botones)
-
-    def _validar_y_aceptar(self):
-        if not self.campo_nombre.text().strip():
-            QMessageBox.warning(self, "Falta el nombre", "Ponele un nombre al grupo.")
-            return
-        if not self.selector.seleccionados():
-            QMessageBox.warning(self, "Sin ítems", "Elegí al menos un ítem.")
-            return
-        self.accept()
-
-    def valores(self):
-        return {
-            'nombre': self.campo_nombre.text().strip(),
-            'item_ids': self.selector.seleccionados(),
-            'ventanas': {tabla: self.campos_ventana[tabla].value() for tabla, _, _ in GRANULARIDADES},
-        }
-
-
-def _crear_modelos_grupo(db, nombre_grupo, item_ids, ventanas):
-    """
-    Crea los 6 modelos de un grupo (ver _DialogoNuevoGrupo) — un
-    regresor y un clasificador por cada granularidad. No aborta ante el
-    primer error (ej. el nombre ya generó un model_id que choca con algo
-    inesperado): intenta los 6 y junta lo que falló, para que el
-    llamador pueda avisar exactamente cuáles se crearon.
+    Crea el par regresor+clasificador de un modelo (ver
+    _DialogoNuevoModelo) -- tipo/cadencia/tabla fijos (ver el docstring
+    del módulo), item_ids/ventana_dias los que eligió el usuario. No
+    aborta ante el primer error (ej. el segundo choca con algo
+    inesperado): intenta los dos y junta lo que falló, para que el
+    llamador pueda avisar exactamente cuál se creó.
 
     Devuelve (creados, errores): `creados` es la lista de model_id dados
     de alta; `errores` es una lista de (model_id, excepción) para los que
     no se pudieron crear.
     """
-    base = _generar_model_id(db, nombre_grupo)
+    id_regresor, id_clasificador = _generar_ids_par(db, nombre)
     creados = []
     errores = []
-    for tabla, etiqueta, _ in GRANULARIDADES:
-        sufijo_tabla = SUFIJO_GRANULARIDAD[tabla]
-        ventana_dias = ventanas[tabla]
-        for tipo, sufijo_tipo in (('regresor', 'regresor'), ('clasificador', 'clasif')):
-            model_id = f"{base}_{sufijo_tabla}_{sufijo_tipo}"
-            try:
-                db.crear_modelo_config(
-                    model_id=model_id, nombre=f"{nombre_grupo} ({etiqueta}, {tipo})",
-                    tipo=tipo, cadencia='manual', modo_seleccion='manual',
-                    item_ids=item_ids, tabla=tabla, ventana_dias=ventana_dias,
-                )
-                creados.append(model_id)
-            except (ValueError, sqlite3.IntegrityError) as e:
-                errores.append((model_id, e))
+    for model_id, tipo, etiqueta_tipo in (
+        (id_regresor, 'regresor', 'regresor'),
+        (id_clasificador, 'clasificador', 'clasificador'),
+    ):
+        try:
+            db.crear_modelo_config(
+                model_id=model_id, nombre=f"{nombre} ({etiqueta_tipo})",
+                tipo=tipo, cadencia=CADENCIA_FIJA, modo_seleccion='manual',
+                item_ids=item_ids, tabla=TABLA_FIJA, ventana_dias=ventana_dias,
+            )
+            creados.append(model_id)
+        except (ValueError, sqlite3.IntegrityError) as e:
+            errores.append((model_id, e))
     return creados, errores
 
 
@@ -307,15 +260,13 @@ class PaginaModelos(QWidget):
         fila_botones = QHBoxLayout()
         boton_nuevo = QPushButton("+ Nuevo modelo")
         boton_nuevo.clicked.connect(self._nuevo_modelo)
-        boton_nuevo_grupo = QPushButton("+ Nuevo grupo")
-        boton_nuevo_grupo.clicked.connect(self._nuevo_grupo)
         self.boton_entrenar = QPushButton("Entrenar ahora")
         self.boton_entrenar.clicked.connect(self._entrenar_seleccionado)
         self.boton_pausar = QPushButton("Pausar / activar")
         self.boton_pausar.clicked.connect(self._alternar_estado_seleccionado)
         self.boton_eliminar = QPushButton("Eliminar")
         self.boton_eliminar.clicked.connect(self._eliminar_seleccionado)
-        for boton in (boton_nuevo, boton_nuevo_grupo, self.boton_entrenar, self.boton_pausar, self.boton_eliminar):
+        for boton in (boton_nuevo, self.boton_entrenar, self.boton_pausar, self.boton_eliminar):
             fila_botones.addWidget(boton)
         fila_botones.addStretch()
         layout.addLayout(fila_botones)
@@ -372,46 +323,22 @@ class PaginaModelos(QWidget):
         if dialogo.exec() != QDialog.Accepted:
             return
         valores = dialogo.valores()
-        model_id = _generar_model_id(self.db, valores['nombre'])
-        try:
-            self.db.crear_modelo_config(
-                model_id=model_id, nombre=valores['nombre'], tipo=valores['tipo'],
-                cadencia=valores['cadencia'], modo_seleccion='manual', item_ids=valores['item_ids'],
-            )
-        except ValueError as e:
-            # Topes técnicos (MAX_ITEMS_POR_MODELO / MAX_MODELOS_ACTIVOS).
-            QMessageBox.warning(self, "No se pudo crear el modelo", str(e))
-            return
-        except sqlite3.IntegrityError as e:
-            # model_id duplicado -- no debería pasar en la práctica
-            # (_generar_model_id ya chequea unicidad justo antes), pero
-            # sqlite3.IntegrityError está documentado como posible en
-            # crear_modelo_config y no había ningún catch para eso.
-            QMessageBox.warning(self, "No se pudo crear el modelo", f"Ya existe un modelo con ese identificador: {e}")
-            return
-        self._refrescar()
-        self.label_estado.setText(f"Modelo '{valores['nombre']}' creado — arrancando walk-forward inicial...")
-        self._encolar_walkforward([model_id])
-
-    def _nuevo_grupo(self):
-        dialogo = _DialogoNuevoGrupo(self.db_path, self)
-        if dialogo.exec() != QDialog.Accepted:
-            return
-        valores = dialogo.valores()
-        creados, errores = _crear_modelos_grupo(self.db, valores['nombre'], valores['item_ids'], valores['ventanas'])
+        creados, errores = _crear_par_modelos(
+            self.db, valores['nombre'], valores['item_ids'], valores['ventana_dias'],
+        )
 
         self._refrescar()
         if creados:
             self.label_estado.setText(
-                f"Grupo '{valores['nombre']}' creado: {len(creados)} modelo(s) "
+                f"Modelo '{valores['nombre']}' creado: {len(creados)} de 2 "
                 f"({'; '.join(creados)}) — arrancando walk-forward inicial de cada uno..."
             )
             self._encolar_walkforward(creados)
         if errores:
             detalle = "\n".join(f"- {model_id}: {e}" for model_id, e in errores)
             QMessageBox.warning(
-                self, "Algunos modelos del grupo no se pudieron crear",
-                f"{len(errores)} de 6 fallaron:\n{detalle}",
+                self, "Algo no se pudo crear",
+                f"{len(errores)} de 2 fallaron:\n{detalle}",
             )
         if not creados and not errores:
             self.label_estado.setText("No se creó ningún modelo.")
