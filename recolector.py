@@ -24,11 +24,81 @@ logging.basicConfig(
     ],
 )
 
-# Lista de ítems a monitorear. Vacía = sin filtro, se recolectan TODOS los
-# ítems que devuelve la API (uso normal). Para pruebas rápidas o acotadas,
-# poner acá una lista de item_ids, ej: [377, 440, 563, 564, 561]
+# Override manual del filtro de ítems, para pruebas rápidas o acotadas: una
+# lista de item_ids, ej: [377, 440, 563, 564, 561]. Vacía (el uso normal) =
+# sin override, cada intervalo aplica su propio criterio — ver _filtro_items.
 ITEM_IDS = []
 api = OSRSGeAPI()
+
+# Intervalos que se guardan SOLO para los ítems de los modelos activos, en
+# vez de para todo el catálogo (ver _filtro_items).
+#
+# precios_5m es el caso: un snapshot de 5m trae 1.776 ítems y se piden 288 por
+# día, así que guardarlos todos con la retención de 30 días tendía a 15,3
+# millones de filas ≈ 634 MB — 3,5 veces la tabla que alimenta TODO el
+# pipeline (precios_1h), para una tabla que ningún modelo ni el screener leen.
+# Acotado a los ítems de los modelos activos son ~18 MB con un modelo de 50
+# ítems y ~143 MB en el caso extremo de MAX_MODELOS_ACTIVOS llenos.
+#
+# El costo de red no cambia (la API devuelve el snapshot completo, no acepta
+# filtrar por ítem); lo que cambia es el disco. Y el dato pasa a ser útil en
+# vez de muerto: son exactamente los ítems que se operan, que es lo que hace
+# falta para calibrar cada cuánto se completan de verdad las dos puntas de un
+# flip (medido: 52% dentro de la hora, 65% en dos horas, sobre los ítems que
+# el modelo elige).
+#
+# precios_1h y precios_6h siguen guardando el catálogo entero: el screener
+# cubre todos los ítems y obtener_top_items_liquidez rankea sobre el universo
+# completo.
+INTERVALOS_ACOTADOS_A_MODELOS = ('5m',)
+
+# Tope de cuánto hacia atrás rellena huecos cada tabla al arrancar, cuando es
+# MENOR que su ventana de retención (mantenimiento.RETENCION_DIAS).
+#
+# precios_5m: rellenar su retención entera son 288 requests por día de hueco
+# — con 14 días serían ~4.000 requests (más de una hora) al arrancar después
+# de un corte largo. No se justifica: la tabla de 5m existe para calibrar la
+# ejecución con datos RECIENTES, no para tener una serie larga; lo viejo se
+# purga igual. Dos días alcanzan y acotan el arranque a ~576 requests en el
+# peor caso.
+#
+# Para un estudio puntual que necesite más historia de 5m conviene el
+# endpoint /timeseries (osrs_ge_api.obtener_precios_item): devuelve 365
+# puntos — 30 horas — de UN ítem en una sola request, mucho más barato que
+# reconstruirlo pidiendo snapshots de todo el catálogo bucket por bucket.
+RELLENO_MAXIMO_DIAS = {'precios_5m': 2}
+
+
+def items_de_interes(db):
+    """
+    Unión de los ítems de todos los modelos ACTIVOS de modelos_config —
+    resolviendo el universo real de cada uno igual que lo hace entrenador.py
+    (la lista explícita si modo_seleccion='manual', el ranking de liquidez si
+    no). Lista vacía si el usuario todavía no creó ningún modelo.
+    """
+    items = set()
+    for cfg in db.listar_modelos_config(estado='activo'):
+        if cfg['modo_seleccion'] == 'manual':
+            items.update(cfg['item_ids'] or [])
+        else:
+            items.update(db.obtener_top_items_liquidez(
+                cfg['n_items'], solo_f2p=cfg['solo_f2p'],
+                precio_minimo=cfg['precio_minimo'], excluir_item_ids=cfg['excluir_item_ids'],
+            ))
+    return sorted(items)
+
+
+def _filtro_items(db, interval):
+    """
+    Qué ítems guardar del snapshot de `interval`: None = todos (sin filtro),
+    o una lista concreta. Una lista VACÍA significa "ninguno": el llamador
+    debe saltear la request entera, no pedirla para tirar el resultado.
+    """
+    if ITEM_IDS:
+        return ITEM_IDS
+    if interval not in INTERVALOS_ACOTADOS_A_MODELOS:
+        return None
+    return items_de_interes(db)
 
 def _ultimo_bucket_cerrado(step, ahora=None):
     """
@@ -91,17 +161,36 @@ def collect_programado(db, interval, n_buckets=2):
     siempre es explícito.
     """
     collect_func, step = INTERVALS[interval]
+
+    filtro = _filtro_items(db, interval)
+    if filtro is not None and not filtro:
+        logging.info(
+            f"Recolección {interval}: no hay modelos activos, así que no hay ítems de interés "
+            "que guardar — se saltea la request (ver INTERVALOS_ACOTADOS_A_MODELOS)."
+        )
+        return
+
     pendientes = _timestamps_pendientes(db, TABLA_POR_INTERVALO[interval], step, n_buckets)
     if not pendientes:
         logging.info(f"Recolección {interval}: sin buckets nuevos que pedir.")
         return
 
     for ts in pendientes:
-        collect_func(db, timestamp=ts)
+        collect_func(db, timestamp=ts, item_ids=filtro)
 
 
-def collect(table, func, interval_name ,db, timestamp = None):
-    """Función genérica para recolectar datos."""
+def collect(table, func, interval_name ,db, timestamp = None, item_ids=None):
+    """
+    Función genérica para recolectar datos.
+
+    item_ids (opcional): guardar solo esos ítems del snapshot. None = todos.
+    El filtrado es del lado de acá porque la API no acepta filtrar por ítem:
+    devuelve siempre el catálogo entero, así que lo que se ahorra es disco,
+    no red (ver INTERVALOS_ACOTADOS_A_MODELOS). Si no se pasa, cae al
+    override manual ITEM_IDS.
+    """
+    if item_ids is None:
+        item_ids = ITEM_IDS
 
     try:
         print(f"Recolectando datos {interval_name}")
@@ -111,13 +200,11 @@ def collect(table, func, interval_name ,db, timestamp = None):
             logging.warning(f"No se obtuvieron datos para {interval_name}")
             return
 
-        # La API entrega el snapshot completo (todos los ítems del juego).
-        # Si ITEM_IDS no está vacío, filtramos a solo esos ítems.
-        if ITEM_IDS:
-            df = df[df['item_id'].isin(ITEM_IDS)]
+        if item_ids:
+            df = df[df['item_id'].isin(item_ids)]
 
             if df.empty:
-                logging.warning(f"Ninguno de los ITEM_IDS monitoreados tenía datos para {interval_name}")
+                logging.warning(f"Ninguno de los ítems monitoreados tenía datos para {interval_name}")
                 return
 
         OSRSBaseDatos.insertar_precios(db, table, df)
@@ -129,14 +216,14 @@ def collect(table, func, interval_name ,db, timestamp = None):
     except Exception as e:
         logging.error(f"Error en collect_{interval_name}: {e}")
 
-def collect_5min(db, timestamp=None):
-    return collect('precios_5m', api.get_historical_5min, '5m', db, timestamp=timestamp)
+def collect_5min(db, timestamp=None, item_ids=None):
+    return collect('precios_5m', api.get_historical_5min, '5m', db, timestamp=timestamp, item_ids=item_ids)
 
-def collect_1h(db, timestamp=None):
-    return collect('precios_1h', api.get_historical_1h, '1h',db, timestamp=timestamp)
+def collect_1h(db, timestamp=None, item_ids=None):
+    return collect('precios_1h', api.get_historical_1h, '1h',db, timestamp=timestamp, item_ids=item_ids)
 
-def collect_6h(db, timestamp=None):
-    return collect('precios_6h', api.get_historical_6h, '6h', db, timestamp=timestamp)
+def collect_6h(db, timestamp=None, item_ids=None):
+    return collect('precios_6h', api.get_historical_6h, '6h', db, timestamp=timestamp, item_ids=item_ids)
 
 
 def _programar_cada_n_minutos_alineado(minutos, func, *args, offset_minutos=0):
@@ -329,7 +416,8 @@ def backfill(interval, start_ts, end_ts, db, delay=1.0):
     return n_calls, total_filas
 
 
-def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=None, debe_detener=None):
+def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=None,
+                       debe_detener=None, item_ids=None):
     """
     Como `backfill()`, pero solo pide a la API los timestamps que la tabla
     todavía no tiene — pensado para rellenar huecos de recolección
@@ -351,6 +439,9 @@ def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=No
     esto, pedir que el recolector se detenga mientras corre un backfill
     largo no tenía ningún efecto hasta que ese backfill terminaba solo —
     ver escritorio/hilo_recolector.py, que pasa `lambda: self._detener`.
+
+    item_ids (opcional): se pasa tal cual a collect() — guardar solo esos
+    ítems de cada snapshot (ver INTERVALOS_ACOTADOS_A_MODELOS).
 
     Devuelve (n_calls, total_filas, faltantes) — `faltantes` es la lista de
     timestamps que efectivamente hacía falta pedir, para que el llamador
@@ -378,7 +469,7 @@ def backfill_faltantes(interval, start_ts, end_ts, db, delay=1.0, on_progreso=No
             logging.info(f"Backfill de faltantes {interval}: interrumpido por pedido externo ({n_calls}/{total})")
             break
 
-        df = collect_func(db, timestamp=ts)
+        df = collect_func(db, timestamp=ts, item_ids=item_ids)
         n_calls += 1
         total_filas += len(df) if df is not None else 0
 
@@ -501,6 +592,11 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
         _, step = INTERVALS[interval]
         ahora_alineado = ahora - (ahora % step)
 
+        filtro = _filtro_items(db, interval)
+        if filtro is not None and not filtro:
+            logging.info(f"{tabla}: sin ítems de interés (no hay modelos activos), no se rellena.")
+            continue
+
         conn = sqlite3.connect(db.db_path)
         c = conn.cursor()
         c.execute(f'SELECT MIN(timestamp) FROM {tabla}')
@@ -511,11 +607,12 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
             logging.info(f"{tabla}: sin datos todavía, nada que rellenar.")
             continue
 
-        limite_retencion = ahora_alineado - RETENCION_DIAS[tabla] * 86400
+        dias_limite = min(RETENCION_DIAS[tabla], RELLENO_MAXIMO_DIAS.get(tabla, RETENCION_DIAS[tabla]))
+        limite_retencion = ahora_alineado - dias_limite * 86400
         if inicio < limite_retencion:
             logging.info(
-                f"{tabla}: MIN(timestamp) es más viejo que la retención "
-                f"({RETENCION_DIAS[tabla]}d) — no se rellena esa parte, se va a purgar sola."
+                f"{tabla}: MIN(timestamp) es más viejo que el tope de relleno "
+                f"({dias_limite}d) — no se rellena esa parte."
             )
             inicio = limite_retencion
 
@@ -530,7 +627,8 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
         logging.info(f"=== Relleno de huecos al iniciar: {interval} desde {inicio_legible} hasta {limite_legible} ===")
         try:
             _, _, faltantes = backfill_faltantes(
-                interval, inicio, limite, db, delay=delay, on_progreso=on_progreso, debe_detener=debe_detener,
+                interval, inicio, limite, db, delay=delay, on_progreso=on_progreso,
+                debe_detener=debe_detener, item_ids=filtro,
             )
         except Exception as e:
             logging.error(f"Error rellenando huecos de {interval}: {e}")

@@ -14,13 +14,15 @@ La política, por tabla:
   diaria en `precios_1h_diario` (conserva la tendencia de largo plazo) y
   después se purgan — archivar_datos_antiguos().
 - precios_5m/precios_6h: purga directa sin downsampling
-  (purgar_datos_antiguos()) — nada en el pipeline usa estas tablas para
-  entrenar o para el screener hoy (el modelo/screener trabajan sobre
-  precios_1h), así que no vale la pena mantener un agregado intermedio.
-  precios_5m con ventana corta (30 días default: es la de mayor volumen, y
-  solo sirve como detalle reciente); precios_6h con ventana aún más corta
-  (7 días default, ver RETENCION_DIAS) — todavía no se usa para nada más
-  que recolección/monitoreo puntual, así que no se justifica retenerla más.
+  (purgar_datos_antiguos()) — ni el entrenamiento ni el screener trabajan
+  sobre estas tablas (los dos usan precios_1h), así que no vale la pena
+  mantener un agregado intermedio. precios_5m tiene un consumidor real —
+  medir cada cuánto se completan de verdad las dos puntas de un flip dentro
+  de la hora — pero para eso alcanza con datos recientes de los ítems que se
+  operan, no con el catálogo entero: por eso se recolecta acotada
+  (recolector.INTERVALOS_ACOTADOS_A_MODELOS) y con ventana de 14 días.
+  precios_6h con ventana aún más corta (7 días, ver RETENCION_DIAS) — todavía
+  no se usa para nada más que recolección/monitoreo puntual.
 - predicciones: purga por ventana de tiempo (180 días default) —
   INSERT OR REPLACE ya deduplica corridas repetidas sobre el mismo período,
   así que el crecimiento neto es proporcional al tiempo, no al número de
@@ -52,7 +54,12 @@ from datetime import datetime, timezone
 RETENCION_DIAS = {
     'precios_1h': 90,
     'precios_6h': 7,
-    'precios_5m': 30,
+    # 14 días, recortado de 30: precios_5m dejó de guardar el catálogo entero
+    # y ahora solo guarda los ítems de los modelos activos
+    # (recolector.INTERVALOS_ACOTADOS_A_MODELOS), y su único consumidor es la
+    # calibración de ejecución, que necesita datos RECIENTES — no una serie
+    # larga. Con 30 días y todo el catálogo la tabla tendía a 634 MB.
+    'precios_5m': 14,
 }
 
 

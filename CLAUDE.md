@@ -100,7 +100,17 @@ La pantalla de Oportunidades muestra el margen predicho para la próxima hora
   que pide explícitamente los últimos buckets cerrados que falten
   (`_ultimo_bucket_cerrado`/`_timestamps_pendientes`, mira 2 para auto-repararse si uno falla o
   todavía no estaba agregado); `collect_5min`/`collect_1h`/`collect_6h` siguen existiendo para
-  el backfill, donde el timestamp siempre es explícito. Sin esto la recolección en vivo iba
+  el backfill, donde el timestamp siempre es explícito. **`precios_5m` se guarda solo para los
+  ítems de los modelos activos** (`INTERVALOS_ACOTADOS_A_MODELOS`/`items_de_interes`/
+  `_filtro_items`; sin modelos no se pide nada): un snapshot de 5m trae 1.776 ítems y se piden
+  288 por día, así que guardarlo entero tendía a 15,3M de filas ≈ 634 MB — 3,5 veces
+  `precios_1h`, que es la tabla que alimenta todo — para algo que ni el screener ni los modelos
+  leen. Acotado son ~18 MB con un modelo de 50 ítems. El costo de red no cambia (la API no
+  acepta filtrar por ítem, manda el catálogo completo igual), solo el disco. `precios_1h` y
+  `precios_6h` siguen guardando todo: el screener cubre el catálogo entero y
+  `obtener_top_items_liquidez` rankea sobre el universo completo. `RELLENO_MAXIMO_DIAS` acota
+  además cuánto hacia atrás rellena huecos cada tabla al arrancar (5m: 2 días — rellenar su
+  retención entera serían ~4.000 requests para datos que solo sirven recientes). Sin esto la recolección en vivo iba
   ~2 horas atrasada y el "pronóstico de la próxima hora" era en realidad el de una hora que ya
   había terminado — y el walk-forward, que asume datos hasta el checkpoint, medía un escenario
   que en vivo nunca se daba;
@@ -305,7 +315,9 @@ La pantalla de Oportunidades muestra el margen predicho para la próxima hora
 - **`mantenimiento.py`**: retención de todas las tablas de series de tiempo — ventanas en
   `RETENCION_DIAS` (`precios_1h`: **90 días**, recortado de 365 porque a esa escala cada insert
   del backfill se volvía carísimo — ver el bullet de `recolector.py`; `precios_6h`: **7 días**;
-  `precios_5m`: 30 días), usado tanto acá como en `recolector.rellenar_huecos_al_inicio` para no
+  `precios_5m`: **14 días**, recortado de 30 cuando esa tabla pasó a guardar solo los ítems de
+  los modelos activos — su único consumidor es la calibración de ejecución, que necesita datos
+  recientes, no una serie larga), usado tanto acá como en `recolector.rellenar_huecos_al_inicio` para no
   tener la ventana duplicada en dos archivos. `archivar_datos_antiguos` agrega `precios_1h` a
   diario antes de purgar; `purgar_datos_antiguos` purga directo sin downsampling
   (`precios_5m`/`precios_6h`/`predicciones`, esta última con 180 días fijo);
