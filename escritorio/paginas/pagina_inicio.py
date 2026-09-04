@@ -12,15 +12,29 @@ conocido de antemano — ver escritorio/hilo_recolector.py), y expone
 cuánto historial hay acumulado sin tener que abrir la DB a mano.
 """
 import logging
+import os
+import time
 from datetime import datetime
 
 import pandas as pd
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QGroupBox, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
+import bloqueo
 from escritorio.hilo_recolector import HiloRecolector
 from escritorio.widgets.tabla_dataframe import crear_tabla
+
+# Cada cuánto se chequea si hay un recolector corriendo AFUERA de la app
+# (típicamente el servicio de systemd, ver docs/despliegue_24_7.md). Barato:
+# es un flock no bloqueante sobre un archivo, no toca la DB.
+MS_CHEQUEO_EXTERNO = 5000
+
+# Cada cuántos chequeos se refresca además el panel de datos, para que la app
+# sirva de monitor en vivo del servicio. Más espaciado porque esto sí hace
+# COUNT(*) sobre tablas de millones de filas (ver _on_progreso).
+CHEQUEOS_POR_REFRESCO_DATOS = 12  # 12 * 5s = 1 minuto
 
 # Orden y nombre legible de cada tabla en el panel "Datos disponibles".
 NOMBRES_TABLAS = {
@@ -48,6 +62,20 @@ def _formatear_fecha_corta(ts):
     return "—" if ts is None else datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
 
 
+def _antiguedad_legible(segundos):
+    """'hace 3 min' / 'hace 2 h' / 'hace 4 días' — para que el estado se lea
+    de un vistazo sin tener que restar timestamps mentalmente."""
+    if segundos is None:
+        return "—"
+    if segundos < 60:
+        return "recién"
+    if segundos < 3600:
+        return f"hace {int(segundos // 60)} min"
+    if segundos < 86400:
+        return f"hace {int(segundos // 3600)} h"
+    return f"hace {int(segundos // 86400)} días"
+
+
 class PaginaInicio(QWidget):
     def __init__(self, db, db_path, parent=None):
         super().__init__(parent)
@@ -55,6 +83,8 @@ class PaginaInicio(QWidget):
         self.db_path = db_path
         self._hilo = None
         self._en_arranque = False
+        self._externo = None      # info del recolector de otro proceso, si lo hay
+        self._ticks = 0
 
         layout = QVBoxLayout(self)
 
@@ -82,11 +112,27 @@ class PaginaInicio(QWidget):
         layout_datos.addWidget(self.tabla_datos)
         layout.addWidget(grupo_datos)
 
+        # Antigüedad del dato más reciente: es la métrica que de verdad
+        # dice si el pipeline está sano — un recolector "corriendo" que hace
+        # tres horas que no inserta nada está roto igual.
+        self.label_frescura = QLabel("")
+        layout.addWidget(self.label_frescura)
+
         layout.addStretch()
 
         self._refrescar_datos_disponibles()
 
+        # Chequeo periódico de un recolector externo (servicio de systemd):
+        # sin esto la app ofrecería "Iniciar recolector" con el servicio ya
+        # andando, y el usuario vería un error recién al apretar el botón.
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._chequear_recolector_externo)
+        self._timer.start(MS_CHEQUEO_EXTERNO)
+        self._chequear_recolector_externo()
+
     def _alternar_recolector(self):
+        if self._externo is not None:
+            return  # el botón ya está desactivado, pero por las dudas
         if self._hilo is None or not self._hilo.isRunning():
             self._iniciar_recolector()
         else:
@@ -184,8 +230,81 @@ class PaginaInicio(QWidget):
                 for tabla, nombre in NOMBRES_TABLAS.items()
             ]
             self.modelo_tabla_datos.set_dataframe(pd.DataFrame(filas))
+            self._actualizar_frescura(resumen)
         except Exception as e:
             logging.error(f"No se pudo refrescar 'Datos disponibles': {e}")
+
+    def _actualizar_frescura(self, resumen):
+        """Antigüedad del último dato horario, que es el que alimenta el
+        screener y todos los modelos — si esto se atrasa, todo lo demás
+        muestra el pasado sin avisar."""
+        hasta = (resumen.get('precios_1h') or {}).get('hasta_ts')
+        if hasta is None:
+            self.label_frescura.setText("Sin datos horarios todavía.")
+            return
+        antiguedad = time.time() - hasta
+        texto = f"Último dato horario: {_antiguedad_legible(antiguedad)}."
+        # Un bucket de 1h cerrado se pide a :01 y tarda unos minutos en
+        # aparecer, así que "hace menos de 2 horas" es lo normal; más que eso
+        # es un síntoma (proceso caído, sin red, o la API devolviendo vacío).
+        if antiguedad > 2 * 3600:
+            texto += "  ⚠ El pipeline está atrasado."
+        self.label_frescura.setText(texto)
+
+    def _chequear_recolector_externo(self):
+        """
+        Detecta un recolector corriendo en OTRO proceso (el servicio de
+        systemd, típicamente) y convierte esta pestaña en un monitor de solo
+        lectura: sin esto, el botón "Iniciar recolector" seguiría ofreciendo
+        arrancar un segundo recolector sobre la misma DB, que es justo lo que
+        el candado de bloqueo.py existe para impedir.
+        """
+        self._ticks += 1
+        try:
+            info = bloqueo.hay_recolector_corriendo(self.db_path)
+        except Exception as e:
+            logging.error(f"No se pudo chequear el candado del recolector: {e}")
+            return
+
+        # El candado tomado por el hilo de esta misma app no cuenta como
+        # "externo": ahí manda el flujo normal del botón.
+        if info is not None and info.get('pid') == os.getpid():
+            info = None
+
+        if info is not None and self._externo is None:
+            self._entrar_modo_monitor(info)
+        elif info is None and self._externo is not None:
+            self._salir_modo_monitor()
+        elif info is not None:
+            self._actualizar_texto_monitor(info)
+
+        if self._externo is not None and self._ticks % CHEQUEOS_POR_REFRESCO_DATOS == 0:
+            self._refrescar_datos_disponibles()
+
+    def _entrar_modo_monitor(self, info):
+        self._externo = info
+        self.boton_toggle.setEnabled(False)
+        self.barra_progreso.setVisible(False)
+        self._actualizar_texto_monitor(info)
+        self._refrescar_datos_disponibles()
+
+    def _salir_modo_monitor(self):
+        self._externo = None
+        self.boton_toggle.setEnabled(True)
+        self.boton_toggle.setText("Iniciar recolector")
+        self.label_estado.setText("Recolector detenido")
+
+    def _actualizar_texto_monitor(self, info):
+        self._externo = info
+        origen = info.get('origen', 'otro proceso')
+        nombre = "servicio del sistema" if origen == bloqueo.ORIGEN_SERVICIO else origen
+        inicio = info.get('inicio')
+        desde = f", activo desde {_antiguedad_legible(time.time() - inicio)}" if inicio else ""
+        self.boton_toggle.setText("Lo maneja el servicio")
+        self.label_estado.setText(
+            f"Recolector corriendo como {nombre} (PID {info.get('pid', '?')}){desde}. "
+            f"Esta pestaña lo muestra en vivo; para pararlo, usá el servicio."
+        )
 
     def hilo_activo(self):
         return self._hilo is not None and self._hilo.isRunning()

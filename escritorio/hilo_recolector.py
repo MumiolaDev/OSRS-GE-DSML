@@ -24,6 +24,7 @@ from PySide6.QtCore import QThread, Signal
 
 import recolector
 from base_de_datos import OSRSBaseDatos
+from bloqueo import BloqueoRecolector, ORIGEN_APP
 
 
 class HiloRecolector(QThread):
@@ -43,6 +44,7 @@ class HiloRecolector(QThread):
         super().__init__(parent)
         self.db_path = db_path
         self._detener = False
+        self._bloqueo = None
 
     def _con_notificacion(self, nombre_legible, func):
         """
@@ -67,6 +69,33 @@ class HiloRecolector(QThread):
         except Exception as e:
             self.error.emit(f"No se pudo abrir la base de datos: {e}")
             return
+
+        # Candado de instancia única (ver bloqueo.py): si el recolector ya
+        # corre como servicio de systemd, arrancar otro desde la app
+        # duplicaría las requests a la API y haría que dos procesos fiteen
+        # XGBoost sobre los mismos ítems pisándose el .pkl. La UI ya
+        # desactiva el botón cuando detecta un recolector externo
+        # (pagina_inicio.py); esto es la red de seguridad para la carrera
+        # entre ese chequeo y el arranque real del hilo.
+        self._bloqueo = BloqueoRecolector(self.db_path, origen=ORIGEN_APP)
+        if not self._bloqueo.adquirir():
+            duenio = self._bloqueo.duenio_previo or {}
+            self.error.emit(
+                f"Ya hay un recolector corriendo sobre esta base de datos "
+                f"(origen: {duenio.get('origen', 'desconocido')}, PID {duenio.get('pid', '?')}). "
+                f"No se arranca un segundo para no duplicar las descargas ni el "
+                f"reentrenamiento."
+            )
+            self._bloqueo = None
+            return
+
+        try:
+            self._correr(db)
+        finally:
+            self._bloqueo.liberar()
+            self._bloqueo = None
+
+    def _correr(self, db):
 
         self.estado_cambio.emit("Actualizando catálogo de ítems...")
         try:

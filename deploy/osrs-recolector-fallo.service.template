@@ -1,0 +1,14 @@
+# Notificación de escritorio cuando el recolector se da por vencido.
+#
+# Se dispara vía OnFailure= del servicio principal, o sea SOLO cuando
+# systemd agotó los reintentos (StartLimitBurst) — no en cada caída suelta,
+# que se reinicia sola y no hace falta molestar por eso.
+
+[Unit]
+Description=Avisa que el recolector de OSRS GE quedó caído
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/notify-send --urgency=critical --icon=dialog-error \
+  "OSRS GE: el recolector se cayó" \
+  "systemd agotó los reintentos. Revisá: journalctl --user -u osrs-recolector -n 50"

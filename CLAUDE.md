@@ -31,6 +31,8 @@ python replay_historico.py        # (como módulo) reentrena walk-forward sobre 
 python backtest.py                # simula la estrategia de flip sobre un rango ya replayeado
 python alertas.py                 # evalúa resumen_actual y manda alertas por Telegram (una vez)
 python mantenimiento.py           # retención/purga de todas las tablas de series de tiempo + vacuum
+python estado.py                  # ¿está sano el pipeline? (solo lectura; --json para waybar, --breve)
+./deploy/instalar_servicio.sh     # Linux: instala el recolector como servicio de usuario de systemd
 streamlit run dashboard.py        # dashboard de monitoreo, solo lectura
 python -m pytest tests/           # tests unitarios de las funciones puras (sin DB, sin red)
 ```
@@ -38,8 +40,10 @@ No hay linter configurado todavía. Los tests (`tests/`) cubren funciones puras 
 margen/dimensionamiento/ventanas por tiempo de `metricas.py`, `_agrupar_en_rangos` y
 `_ultimo_bucket_cerrado` de `recolector.py`, `calcular_checkpoints` de `replay_historico.py`,
 `_clasificar_retorno` y `accuracy_direccional` de `entrenador.py`, la grilla regular y las
-features relativas de `preprocesamiento.py`) más los que usan una DB SQLite temporal
-(`modelos_config`, helpers de `pagina_modelos.py`) — nada que toque la API real.
+features relativas de `preprocesamiento.py`, el veredicto de salud de `estado.py`) más los que
+usan una DB SQLite temporal (`modelos_config`, helpers de `pagina_modelos.py`) o un archivo
+temporal (el candado de `bloqueo.py`, incluido un subproceso que muere sin liberarlo) — nada
+que toque la API real.
 
 ## Arquitectura del pipeline
 
@@ -64,6 +68,14 @@ entrenador.entrenar_desde_config() ramifica por modelos_config.tipo ('spread' | 
 'clasificador') y job_horario/job_diario reentrenan CUALQUIER modelo con esa cadencia, sin
 distinción de código entre tipos ni entre "modelos del sistema" y "modelos del usuario" (no
 existen los primeros) — ver el bullet de entrenador.py.
+
+bloqueo.py da un candado flock sobre `<db_path>.lock`: UN solo recolector por DB. Lo toman
+recolector.py.__main__ y escritorio/hilo_recolector.py, y es lo que hace seguro tener el
+servicio de systemd corriendo (docs/despliegue_24_7.md) y abrir la app igual.
+estado.py responde "¿el pipeline está sano?" en una pantalla, sin abrir la app ni la DB —
+solo lectura, pensado también para la barra de estado (--json) y para scripts (código de
+salida). Su veredicto sale de la ANTIGÜEDAD del último dato horario, no de si el proceso vive:
+un recolector colgado sigue verde en `systemctl status` mientras hace horas que no inserta.
 
 dashboard.py (Streamlit) lee resumen_actual / model_metrics / predicciones — solo lectura.
 escritorio/ (PySide6/Qt) es la app de escritorio para el usuario final — lee y ESCRIBE
@@ -338,7 +350,33 @@ La pantalla de Oportunidades muestra el margen predicho para la próxima hora
   `prediccion.pronosticar_clase_item()` y cruzado con `margen_neto`/`roi_pct` de `resumen_actual`
   para que sea accionable, default `f2p10_100gp_clasif` (mismo caso: solo si existe). Nunca
   escribe en la DB.
-- **`escritorio/`**: app de escritorio en PySide6/Qt para el usuario final. "+ Nuevo modelo"
+- **`bloqueo.py`**: candado de instancia única (`flock` sobre `<db_path>.lock`). Existe porque
+  el recolector desplegado como servicio (`docs/despliegue_24_7.md`) y el hilo del recolector de
+  la app de escritorio pueden arrancar los dos sobre la misma DB: no corrompe nada (WAL +
+  `busy_timeout`) pero duplica las requests a la API, hace que dos procesos fiteen XGBoost sobre
+  los mismos ítems pisándose el `.pkl`, y corre el relleno de huecos dos veces en paralelo. Se
+  usa `flock` y **no** un archivo de PID a propósito: el kernel lo libera solo cuando el proceso
+  muere, como sea que muera, así que no existe el candado rancio ni la carrera de "leo el PID,
+  chequeo si vive". El JSON que guarda adentro (pid/origen/inicio) es informativo — la exclusión
+  la da el flock, no el contenido; `adquirir()` abre en `'a+'` y no `'w'` para no truncarle esa
+  info al que sí lo tiene. `hay_recolector_corriendo(db_path)` lo consulta sin robárselo.
+- **`estado.py`**: resumen de salud del pipeline en una pantalla, de solo lectura (no arranca
+  nada, no toca la API, se puede correr con el recolector andando). Tres salidas del mismo dict
+  (`recolectar_estado`) para que no puedan discrepar: humana, `--breve` y `--json` (contrato de
+  módulo custom de waybar: text/tooltip/class). La pregunta que contesta **no** es "¿el proceso
+  está vivo?" sino "¿los datos están al día?" — por eso `_veredicto` sale de la antigüedad de
+  `precios_1h` (`ANTIGUEDAD_OK_H`=2, que es lo normal porque el bucket se pide a :01 y la API
+  tarda un rato en agregarlo; `ANTIGUEDAD_GRAVE_H`=6) y el estado del proceso es un dato más.
+  Código de salida 0/1/2 para usarlo en scripts.
+- **`deploy/`**: plantillas de la unidad de systemd (servicio de USUARIO: el recolector escribe
+  en el home y no necesita privilegios), de la unidad `OnFailure` que manda una notificación de
+  escritorio cuando systemd agota los reintentos, y del lanzador `.desktop`; más
+  `instalar_servicio.sh`, que resuelve la ruta del proyecto y el intérprete del venv (el
+  servicio no hereda ningún `activate`), renderiza los `@MARCADOR@` y deja todo habilitado.
+  Idempotente, con `--sin-iniciar` y `--desinstalar`. `loginctl enable-linger` queda a cargo del
+  usuario porque pide autenticación — sin eso el servicio arranca recién al iniciar sesión.
+- **`escritorio/`**: app de escritorio en PySide6/Qt para el usuario final. Corre nativa en
+  Wayland/Hyprland (verificado con PySide6 6.11 + `qt6-wayland`, sin necesidad de XWayland). "+ Nuevo modelo"
   crea UN modelo de tipo 'spread' (antes creaba un par regresor+clasificador; ver el bullet de
   `entrenador.py`), y "Oportunidades" muestra el **margen predicho para la próxima hora** como
   columna principal y ordena por ella — esa columna es la respuesta a "qué comprar", y a
@@ -348,7 +386,12 @@ La pantalla de Oportunidades muestra el margen predicho para la próxima hora
   dashboard de Streamlit que tiene mucha más carga de información pensada para el desarrollador.
   `escritorio/main.py` es el punto de entrada (`python -m escritorio.main`).
   `escritorio/paginas/pagina_inicio.py` controla el hilo del recolector (arrancar/parar) y
-  muestra progreso real del relleno de huecos/replay. `pagina_oportunidades.py` fusiona
+  muestra progreso real del relleno de huecos/replay. Si detecta un recolector corriendo en OTRO
+  proceso (el candado de `bloqueo.py`; típicamente el servicio de systemd) pasa a **modo
+  monitor**: desactiva el botón, dice quién lo está corriendo desde cuándo, y refresca solo el
+  panel de datos — sin eso el botón ofrecería arrancar un segundo recolector y el usuario vería
+  el error recién al apretarlo. Muestra además la antigüedad del último dato horario, que es lo
+  que de verdad dice si el pipeline está sano. `pagina_oportunidades.py` fusiona
   screener + margen predicho de cualquier modelo de spread activo en una sola tabla.
   `pagina_modelos.py` es la única pantalla que ESCRIBE en `modelos_config`:
   "+ Nuevo modelo" crea un modelo de tipo 'spread' (cadencia horaria, tabla

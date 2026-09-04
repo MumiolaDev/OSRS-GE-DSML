@@ -1,0 +1,43 @@
+# Servicio de usuario (systemd --user) para el recolector 24/7.
+#
+# No se instala copiando este archivo: las rutas dependen de dónde esté el
+# proyecto y cuál sea el intérprete del entorno virtual, así que
+# deploy/instalar_servicio.sh reemplaza los marcadores @...@ y lo deja en
+# ~/.config/systemd/user/. Ver docs/despliegue_24_7.md.
+#
+# Es un servicio de USUARIO y no del sistema a propósito: el recolector
+# escribe en el home del usuario (data/, models/, logs/, config.json) y no
+# necesita ningún privilegio. Un servicio de sistema tendría que correr como
+# otro usuario y resolver permisos sobre esos directorios sin ganar nada.
+
+[Unit]
+Description=OSRS GE — recolector de precios 24/7
+Documentation=file://@PROYECTO@/docs/despliegue_24_7.md
+# Si crashea 5 veces en 5 minutos, systemd deja de reintentar y lo marca
+# como fallido — sin esto, un error de arranque permanente (ej. la DB
+# borrada) se convierte en un loop que le pega a la API para siempre.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=osrs-recolector-fallo.service
+
+[Service]
+Type=simple
+WorkingDirectory=@PROYECTO@
+# -u (sin buffer): sin esto journald recibe la salida a bloques de 4KB y el
+# log parece congelado durante minutos. El logging a logs/recolector.log lo
+# hace el propio script (ver recolector.py).
+ExecStart=@PYTHON@ -u recolector.py
+# El '-' inicial: si el archivo no existe, el servicio arranca igual. Es la
+# forma de pasarle las credenciales de Telegram al proceso sin ponerlas en
+# el repo ni en el unit file (ver docs/despliegue_24_7.md).
+EnvironmentFile=-%h/.config/osrs-ge/env
+Restart=always
+RestartSec=60
+# Prioridad baja: esto corre todo el día en la máquina de escritorio del
+# usuario y el reentrenamiento de XGBoost usa todos los cores. Nice=10 hace
+# que no se note mientras se está usando la PC.
+Nice=10
+SyslogIdentifier=osrs-recolector
+
+[Install]
+WantedBy=default.target

@@ -4,9 +4,9 @@ Pipeline en Python que recolecta precios de compra/venta del **Grand Exchange** 
 RuneScape desde la API pública de la OSRS Wiki, los almacena en SQLite, calcula un screener de
 oportunidades de flip y entrena modelos de ML (XGBoost) que predicen el margen neto que va a
 dejar cada ítem en la próxima hora — con el objetivo de ayudar a decidir qué comprar, cuándo
-comprar y cuándo vender. Corre
-pensado para 24/7, manda alertas de oportunidades por Telegram y expone un dashboard de
-monitoreo en Streamlit; la futura app web para el usuario final todavía no existe.
+comprar y cuándo vender. Corre pensado para 24/7 (servicio de systemd en Linux), manda alertas
+de oportunidades por Telegram, y tiene una app de escritorio en PySide6/Qt para el usuario
+final más un dashboard de monitoreo en Streamlit para el desarrollador.
 
 ## Qué hace hoy
 
@@ -34,18 +34,25 @@ monitoreo en Streamlit; la futura app web para el usuario final todavía no exis
 - **Expone un dashboard** de monitoreo en Streamlit (solo lectura): screener filtrable,
   calidad del modelo en el tiempo, predicción vs. realidad, pronóstico a futuro y el ranking de
   qué comprar.
+- **Corre desatendido**: se instala como servicio de usuario de systemd con un comando
+  (`./deploy/instalar_servicio.sh`), se reinicia solo si crashea y avisa por notificación de
+  escritorio si se da por vencido. Un candado de instancia única impide que el servicio y la
+  app recolecten a la vez sobre la misma base.
 - **Tests unitarios** (pytest) de las funciones puras del pipeline (impuesto/margen, ventanas
   por tiempo, agrupamiento de huecos, checkpoints del replay, umbral del clasificador,
-  accuracy direccional, grilla temporal y features relativas).
+  accuracy direccional, grilla temporal, features relativas, candado y veredicto de salud).
 
 ## Qué falta / en desarrollo
 
-- **Aplicación web** para el usuario final — hoy solo existe el dashboard interno de
-  monitoreo, de solo lectura.
+- **Aplicación web** para el usuario final — hoy hay una app de escritorio (PySide6/Qt) y el
+  dashboard interno de monitoreo, de solo lectura.
 - **Modelar la probabilidad de que las órdenes se completen.** Toda la ventaja medida del
   modelo asume que la compra en la punta baja y la venta en la alta se llenan; si hay que cruzar
-  el spread, ninguna estrategia gana. Hoy el backtest acota ese riesgo con dos cotas, pero falta
-  estimar el número real con datos de 5 minutos.
+  el spread, ninguna estrategia gana. Ya hay una primera medición con datos de 5 minutos (de los
+  ítems que el modelo elige: 78% de las compras se llenan y 52% de los flips se completan dentro
+  de la hora, 65% en dos; de lo que queda colgado, el 78% recupera el precio de venta dentro de
+  6 horas), pero es una muestra chica y todavía no corre sola: falta convertirla en una
+  calibración periódica que la app muestre.
 - El margen predicho anota las alertas de Telegram pero todavía no las filtra: el filtro
   principal sigue siendo el screener.
 
@@ -66,6 +73,10 @@ monitoreo en Streamlit; la futura app web para el usuario final todavía no exis
 | `prediccion.py` | Pronóstico hacia adelante con el modelo ya entrenado |
 | `alertas.py` | Notificaciones de oportunidades por Telegram |
 | `mantenimiento.py` | Retención, downsampling y vacuum de la base de datos |
+| `bloqueo.py` | Candado de instancia única del recolector (un solo proceso por base) |
+| `estado.py` | Estado de salud del pipeline en una pantalla (terminal, barra de estado, scripts) |
+| `escritorio/` | App de escritorio (PySide6/Qt) para el usuario final |
+| `deploy/` | Servicio de systemd, lanzador de escritorio e instalador (Linux) |
 | `dashboard.py` | Panel de monitoreo en Streamlit |
 | `backfill_historico.py` | Relleno manual de huecos sin reiniciar el recolector |
 | `tests/` | Tests unitarios de las funciones puras |
@@ -76,8 +87,17 @@ monitoreo en Streamlit; la futura app web para el usuario final todavía no exis
 ```bash
 pip install -r requirements.txt
 python recolector.py              # recolector 24/7 (recolección + reentrenamiento + alertas)
+python -m escritorio.main         # app de escritorio
+python estado.py                  # ¿está sano el pipeline?
 streamlit run dashboard.py        # dashboard de monitoreo, solo lectura
 python -m pytest tests/           # tests unitarios
+```
+
+Para dejarlo corriendo permanentemente en Linux (arranca con la PC, se reinicia solo):
+
+```bash
+./deploy/instalar_servicio.sh
+loginctl enable-linger $USER      # este paso pide autenticación, por eso va aparte
 ```
 
 Ver `CLAUDE.md` para el detalle de arquitectura, cada módulo y sus decisiones de diseño, y

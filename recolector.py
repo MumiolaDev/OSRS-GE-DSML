@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import sys
 import schedule
 import time
 import logging
@@ -9,6 +10,8 @@ from base_de_datos import OSRSBaseDatos
 from metricas import calcular_resumen_todos
 from entrenador import entrenar_desde_config
 from mantenimiento import ejecutar_mantenimiento_semanal
+from bloqueo import BloqueoRecolector, ORIGEN_SERVICIO
+import configuracion
 
 
 # Configurar logging: a archivo además de consola. Necesario para poder
@@ -666,53 +669,77 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
 
 
 if __name__ == "__main__":
-    db = OSRSBaseDatos('data/osrs_ge.db')
-    logging.info("Iniciando recolector...")
+    # db_path de config.json (la misma fuente que usa la app de escritorio,
+    # ver escritorio/ventana_principal.py) — si el usuario cambia la ruta
+    # desde la pestaña Configuración, el servicio 24/7 tiene que seguir
+    # escribiendo en la MISMA DB que la app lee, no en la de por default.
+    db_path = configuracion.obtener('db_path') or 'data/osrs_ge.db'
 
-    # Catálogo de ítems (id -> nombre, members, buy_limit). Se actualiza cada
-    # vez que arranca el recolector; los datos cambian muy rara vez.
-    mapping = api.get_item_mapping()
-    n_items = db.guardar_items(mapping)
-    logging.info(f"Catálogo de ítems actualizado: {n_items} ítems")
+    # Candado de instancia única: con el recolector desplegado como servicio
+    # (docs/despliegue_24_7.md) es fácil abrir la app y arrancar sin querer un
+    # segundo recolector sobre la misma DB — ver bloqueo.py.
+    bloqueo = BloqueoRecolector(db_path, origen=ORIGEN_SERVICIO)
+    if not bloqueo.adquirir():
+        duenio = bloqueo.duenio_previo or {}
+        logging.error(
+            f"Ya hay un recolector corriendo sobre '{db_path}' "
+            f"(origen={duenio.get('origen', '?')}, pid={duenio.get('pid', '?')}). "
+            f"Este proceso no arranca: dos recolectores duplican las requests a la "
+            f"API y se pisan al reentrenar."
+        )
+        sys.exit(1)
 
-    # Ejecutar inmediatamente al arrancar
-    for intervalo in ('5m', '1h', '6h'):
-        collect_programado(db, intervalo)
+    try:
+        db = OSRSBaseDatos(db_path)
+        logging.info("Iniciando recolector...")
 
-    # Rellenar huecos dejados por cortes anteriores antes de entrar al loop
-    # — así el recolector se pone al día solo en cada arranque. Incluye el
-    # replay histórico si había huecos en precios_1h (ver
-    # rellenar_huecos_al_inicio/replay_historico.py).
-    rellenar_huecos_al_inicio(db)
+        # Catálogo de ítems (id -> nombre, members, buy_limit). Se actualiza cada
+        # vez que arranca el recolector; los datos cambian muy rara vez.
+        mapping = api.get_item_mapping()
+        n_items = db.guardar_items(mapping)
+        logging.info(f"Catálogo de ítems actualizado: {n_items} ítems")
 
-    # Si job_semanal no corrió en su ventana programada (proceso apagado
-    # justo el domingo 04:00 UTC), hacer catch-up ahora en vez de esperar
-    # hasta el domingo siguiente.
-    verificar_catchup_semanal(db)
+        # Ejecutar inmediatamente al arrancar
+        for intervalo in ('5m', '1h', '6h'):
+            collect_programado(db, intervalo)
 
-    # Catch-up en vivo: refresca resumen_actual y el modelo productivo ahora
-    # mismo, en vez de esperar al próximo :05 programado — importante sobre
-    # todo después de un replay largo, para no dejar el dashboard/las
-    # alertas con datos desactualizados hasta la próxima hora en punto.
-    job_horario(db)
+        # Rellenar huecos dejados por cortes anteriores antes de entrar al loop
+        # — así el recolector se pone al día solo en cada arranque. Incluye el
+        # replay histórico si había huecos en precios_1h (ver
+        # rellenar_huecos_al_inicio/replay_historico.py).
+        rellenar_huecos_al_inicio(db)
 
-    # Programar tareas, alineadas al reloj de pared (:00/:05/:10... en vez de
-    # relativas a cuándo arrancó este proceso) — ver _programar_cada_n_minutos_alineado.
-    # Un minuto DESPUÉS de cada cierre de bucket (offset_minutos=1, :01 en
-    # vez de :00): pedirle a la API el bucket en el segundo exacto en que
-    # cierra puede devolverlo vacío porque todavía no lo agregó. Si aun así
-    # pasa, collect_programado lo vuelve a pedir en el tick siguiente.
-    _programar_cada_n_minutos_alineado(5, collect_programado, db, '5m', offset_minutos=1)
-    schedule.every().hour.at(":01", "UTC").do(collect_programado, db, '1h')
-    for h in (0, 6, 12, 18):
-        schedule.every().day.at(f"{h:02d}:01", "UTC").do(collect_programado, db, '6h')
-    # job_horario a :05, cinco minutos después de collect_1h, para no competir
-    # por I/O/CPU con la recolección que acaba de correr en el mismo minuto.
-    schedule.every().hour.at(":05", "UTC").do(job_horario, db)
-    schedule.every().day.at("03:00", "UTC").do(job_diario, db)
-    schedule.every().sunday.at("04:00", "UTC").do(job_semanal, db)
-    while True:
+        # Si job_semanal no corrió en su ventana programada (proceso apagado
+        # justo el domingo 04:00 UTC), hacer catch-up ahora en vez de esperar
+        # hasta el domingo siguiente.
+        verificar_catchup_semanal(db)
 
-        schedule.run_pending()
-        time.sleep(1)
+        # Catch-up en vivo: refresca resumen_actual y el modelo productivo ahora
+        # mismo, en vez de esperar al próximo :05 programado — importante sobre
+        # todo después de un replay largo, para no dejar el dashboard/las
+        # alertas con datos desactualizados hasta la próxima hora en punto.
+        job_horario(db)
 
+        # Programar tareas, alineadas al reloj de pared (:00/:05/:10... en vez de
+        # relativas a cuándo arrancó este proceso) — ver _programar_cada_n_minutos_alineado.
+        # Un minuto DESPUÉS de cada cierre de bucket (offset_minutos=1, :01 en
+        # vez de :00): pedirle a la API el bucket en el segundo exacto en que
+        # cierra puede devolverlo vacío porque todavía no lo agregó. Si aun así
+        # pasa, collect_programado lo vuelve a pedir en el tick siguiente.
+        _programar_cada_n_minutos_alineado(5, collect_programado, db, '5m', offset_minutos=1)
+        schedule.every().hour.at(":01", "UTC").do(collect_programado, db, '1h')
+        for h in (0, 6, 12, 18):
+            schedule.every().day.at(f"{h:02d}:01", "UTC").do(collect_programado, db, '6h')
+        # job_horario a :05, cinco minutos después de collect_1h, para no competir
+        # por I/O/CPU con la recolección que acaba de correr en el mismo minuto.
+        schedule.every().hour.at(":05", "UTC").do(job_horario, db)
+        schedule.every().day.at("03:00", "UTC").do(job_diario, db)
+        schedule.every().sunday.at("04:00", "UTC").do(job_semanal, db)
+        while True:
+
+            schedule.run_pending()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Recolector detenido a mano (Ctrl-C)")
+    finally:
+        bloqueo.liberar()

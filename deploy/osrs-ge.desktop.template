@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OSRS GE Predictor
+Comment=Oportunidades de flip del Grand Exchange
+Exec=@PYTHON@ -m escritorio.main
+Path=@PROYECTO@
+Icon=applications-office
+Terminal=false
+Categories=Office;Finance;
+StartupWMClass=python3
