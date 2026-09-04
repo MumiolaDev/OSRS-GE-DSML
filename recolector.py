@@ -3,7 +3,7 @@ import sqlite3
 import schedule
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from osrs_ge_api import OSRSGeAPI
 from base_de_datos import OSRSBaseDatos
 from metricas import calcular_resumen_todos
@@ -29,6 +29,76 @@ logging.basicConfig(
 # poner acá una lista de item_ids, ej: [377, 440, 563, 564, 561]
 ITEM_IDS = []
 api = OSRSGeAPI()
+
+def _ultimo_bucket_cerrado(step, ahora=None):
+    """
+    Timestamp del último bucket de `step` segundos que YA cerró.
+
+    Existe porque pedirle a la API el snapshot "más reciente" (sin
+    timestamp) no devuelve el último bucket cerrado sino uno más viejo
+    todavía. Verificado contra la API real: a las 13:39 UTC, `/1h` sin
+    timestamp devuelve el bucket de las 11:00, mientras que
+    `/1h?timestamp=12:00` devuelve 3.055 ítems sin problema. El de las 13:00
+    (la hora en curso) sí vuelve vacío, como corresponde.
+
+    El efecto en cadena de esa hora extra era grave y silencioso: la
+    recolección de las 13:00 insertaba el bucket de las 11:00, job_horario
+    reentrenaba a las 13:05 con datos que terminaban a las 11:00, y el
+    "pronóstico de la próxima hora" era en realidad el de las 12:00 — una
+    hora que ya había terminado. Peor: el walk-forward asume que en el
+    checkpoint T hay datos hasta T, que en vivo nunca era cierto, así que la
+    evaluación medía un escenario mejor que el real.
+    """
+    ahora = int(time.time()) if ahora is None else int(ahora)
+    return (ahora - ahora % step) - step
+
+
+def _timestamps_pendientes(db, tabla, step, n_buckets=2, ahora=None):
+    """
+    De los últimos `n_buckets` buckets cerrados, los que la tabla todavía no
+    tiene, en orden cronológico.
+
+    Se miran dos (y no solo el último) para que la recolección se
+    auto-repare: si el bucket recién cerrado todavía no estaba agregado del
+    lado de la wiki cuando se lo pidió — o si la request falló — el tick
+    siguiente lo vuelve a intentar, en vez de dejar un hueco permanente que
+    solo se llenaba al reiniciar el proceso (rellenar_huecos_al_inicio).
+    """
+    ultimo = _ultimo_bucket_cerrado(step, ahora)
+    candidatos = [ultimo - k * step for k in range(n_buckets)]
+
+    conn = sqlite3.connect(db.db_path)
+    c = conn.cursor()
+    placeholders = ','.join('?' * len(candidatos))
+    c.execute(
+        f'SELECT DISTINCT timestamp FROM {tabla} WHERE timestamp IN ({placeholders})', candidatos,
+    )
+    existentes = {fila[0] for fila in c.fetchall()}
+    conn.close()
+
+    return sorted(ts for ts in candidatos if ts not in existentes)
+
+
+def collect_programado(db, interval, n_buckets=2):
+    """
+    Recolección periódica de `interval` ('5m'|'1h'|'6h'): pide EXPLÍCITAMENTE
+    los buckets cerrados que falten (ver _timestamps_pendientes) en vez de
+    pedir "el más reciente" sin timestamp, que devuelve datos más viejos de
+    lo necesario (ver _ultimo_bucket_cerrado).
+
+    Es la función que registra el scheduler; collect_5min/collect_1h/
+    collect_6h siguen existiendo para el backfill, donde el timestamp
+    siempre es explícito.
+    """
+    collect_func, step = INTERVALS[interval]
+    pendientes = _timestamps_pendientes(db, TABLA_POR_INTERVALO[interval], step, n_buckets)
+    if not pendientes:
+        logging.info(f"Recolección {interval}: sin buckets nuevos que pedir.")
+        return
+
+    for ts in pendientes:
+        collect_func(db, timestamp=ts)
+
 
 def collect(table, func, interval_name ,db, timestamp = None):
     """Función genérica para recolectar datos."""
@@ -69,7 +139,7 @@ def collect_6h(db, timestamp=None):
     return collect('precios_6h', api.get_historical_6h, '6h', db, timestamp=timestamp)
 
 
-def _programar_cada_n_minutos_alineado(minutos, func, db):
+def _programar_cada_n_minutos_alineado(minutos, func, *args, offset_minutos=0):
     """
     Registra `func` para correr en cada múltiplo de `minutos` dentro de la
     hora (:00, :05, ..., :55 si minutos=5), alineado al reloj de pared — a
@@ -79,9 +149,14 @@ def _programar_cada_n_minutos_alineado(minutos, func, db):
     nativa de "cada N minutos alineado al reloj"; se logra registrando un
     job por cada minuto múltiplo de N vía `every().hour.at(':MM')`, que sí
     es una hora de reloj absoluta.
+
+    offset_minutos: corre `offset_minutos` después de cada múltiplo (:01,
+    :06, :11... con minutos=5, offset=1). Sirve para no pedirle a la API un
+    bucket en el instante exacto en que cierra, cuando puede no estar
+    agregado todavía del otro lado.
     """
     for m in range(0, 60, minutos):
-        schedule.every().hour.at(f":{m:02d}", "UTC").do(func, db)
+        schedule.every().hour.at(f":{(m + offset_minutos) % 60:02d}", "UTC").do(func, *args)
 
 
 INTERVALS = {
@@ -244,7 +319,7 @@ def backfill(interval, start_ts, end_ts, db, delay=1.0):
         if n_calls % 24 == 0:
             logging.info(
                 f"Backfill {interval}: {n_calls} llamadas, {total_filas} filas "
-                f"acumuladas (última ts={ts}, {datetime.utcfromtimestamp(ts)} UTC)"
+                f"acumuladas (última ts={ts}, {datetime.fromtimestamp(ts, timezone.utc)} UTC)"
             )
 
         ts += step
@@ -366,15 +441,22 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
     intermitencia sola — antes había que acordarse de correr
     backfill_historico.py a mano después de cada corte.
 
-    Solo `precios_1h` alimenta el modelo/screener (build_training_set,
-    calcular_resumen_todos), así que solo para ese intervalo, después de
-    rellenar los datos crudos, se agrupan los huecos detectados en rangos
-    contiguos (_agrupar_en_rangos) y se dispara replay_historico.ejecutar_replay
-    por cada uno — reentrena en los momentos exactos en que job_horario/
-    job_diario habrían corrido durante ese hueco, en vez de esperar a un
-    solo reentrenamiento final con todo el historial (ver
-    replay_historico.py para el porqué). Para 5m/6h no hace falta: no
-    alimentan ningún entrenamiento.
+    Después de rellenar los datos crudos, los huecos detectados se agrupan
+    en rangos contiguos (_agrupar_en_rangos) y se dispara
+    replay_historico.ejecutar_replay_modelo sobre cada rango, para cada
+    modelo activo de modelos_config cuya tabla sea la de ese intervalo —
+    reentrena en los momentos exactos en que el modelo se habría reentrenado
+    durante el hueco, en vez de esperar a un solo reentrenamiento final con
+    todo el historial (ver replay_historico.py para el porqué).
+
+    Antes esto llamaba a `ejecutar_replay()`, que reentrena dos modelos
+    FIJOS: 'global_horario' y 'global_diario'. Esos modelos ya no existen —
+    modelos_config arranca vacía y todo modelo lo crea el usuario (ver
+    base_de_datos._migrar_esquema) — así que un hueco de una semana
+    disparaba 168 entrenamientos de XGBoost sobre 200 ítems para producir
+    métricas de dos modelos que nadie tiene, mientras los modelos reales del
+    usuario quedaban sin cubrir. Ahora el replay sigue a modelos_config, que
+    es también lo que hacen job_horario/job_diario.
 
     Si una tabla todavía no tiene ningún dato (item/intervalo nuevo, ej. la
     primera vez que se activó 6h) no hay huecos que rellenar — la
@@ -405,9 +487,10 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
     aritmética de más abajo quede alineada también.
     """
     from mantenimiento import RETENCION_DIAS
-    from replay_historico import ejecutar_replay
+    from replay_historico import ejecutar_replay_modelo
 
     ahora = int(time.time())
+    rangos_por_tabla = {}
 
     for interval in intervalos:
         if debe_detener is not None and debe_detener():
@@ -453,19 +536,35 @@ def rellenar_huecos_al_inicio(db, intervalos=('1h', '5m', '6h'), delay=1.0, on_p
             logging.error(f"Error rellenando huecos de {interval}: {e}")
             continue
 
-        if interval != '1h' or not faltantes:
-            continue
+        if faltantes:
+            rangos_por_tabla[tabla] = _agrupar_en_rangos(faltantes, step)
 
-        rangos = _agrupar_en_rangos(faltantes, step)
-        logging.info(f"Replay histórico: {len(rangos)} rango(s) de hueco detectado(s) en precios_1h")
+    if not rangos_por_tabla:
+        return
+
+    modelos = [m for m in db.listar_modelos_config(estado='activo') if m['cadencia'] != 'manual']
+    if not modelos:
+        logging.info(
+            "Huecos rellenados, pero no hay modelos activos en modelos_config: no hay nada que "
+            "replayear (crear uno desde \"Mis modelos\" en la app de escritorio)."
+        )
+        return
+
+    for cfg in modelos:
+        rangos = rangos_por_tabla.get(cfg.get('tabla') or 'precios_1h', [])
         for inicio_rango, fin_rango in rangos:
             if debe_detener is not None and debe_detener():
                 logging.info("rellenar_huecos_al_inicio: replay interrumpido por pedido externo")
-                break
+                return
             try:
-                ejecutar_replay(db, inicio_rango, fin_rango, on_progreso=on_progreso, debe_detener=debe_detener)
+                ejecutar_replay_modelo(
+                    db, cfg['model_id'], desde_ts=inicio_rango, hasta_ts=fin_rango,
+                    on_progreso=on_progreso, debe_detener=debe_detener,
+                )
             except Exception as e:
-                logging.error(f"Error en replay histórico del rango {inicio_rango}-{fin_rango}: {e}")
+                logging.error(
+                    f"Error en replay de '{cfg['model_id']}' sobre el rango {inicio_rango}-{fin_rango}: {e}"
+                )
 
 
 if __name__ == "__main__":
@@ -479,9 +578,8 @@ if __name__ == "__main__":
     logging.info(f"Catálogo de ítems actualizado: {n_items} ítems")
 
     # Ejecutar inmediatamente al arrancar
-    data_5m = collect_5min(db)
-    data_1h = collect_1h(db)
-    data_6h = collect_6h(db)
+    for intervalo in ('5m', '1h', '6h'):
+        collect_programado(db, intervalo)
 
     # Rellenar huecos dejados por cortes anteriores antes de entrar al loop
     # — así el recolector se pone al día solo en cada arranque. Incluye el
@@ -502,10 +600,14 @@ if __name__ == "__main__":
 
     # Programar tareas, alineadas al reloj de pared (:00/:05/:10... en vez de
     # relativas a cuándo arrancó este proceso) — ver _programar_cada_n_minutos_alineado.
-    _programar_cada_n_minutos_alineado(5, collect_5min, db)
-    schedule.every().hour.at(":00", "UTC").do(collect_1h, db)
+    # Un minuto DESPUÉS de cada cierre de bucket (offset_minutos=1, :01 en
+    # vez de :00): pedirle a la API el bucket en el segundo exacto en que
+    # cierra puede devolverlo vacío porque todavía no lo agregó. Si aun así
+    # pasa, collect_programado lo vuelve a pedir en el tick siguiente.
+    _programar_cada_n_minutos_alineado(5, collect_programado, db, '5m', offset_minutos=1)
+    schedule.every().hour.at(":01", "UTC").do(collect_programado, db, '1h')
     for h in (0, 6, 12, 18):
-        schedule.every().day.at(f"{h:02d}:00", "UTC").do(collect_6h, db)
+        schedule.every().day.at(f"{h:02d}:01", "UTC").do(collect_programado, db, '6h')
     # job_horario a :05, cinco minutos después de collect_1h, para no competir
     # por I/O/CPU con la recolección que acaba de correr en el mismo minuto.
     schedule.every().hour.at(":05", "UTC").do(job_horario, db)

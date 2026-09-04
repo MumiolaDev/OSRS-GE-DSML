@@ -19,29 +19,10 @@ import streamlit as st
 
 from base_de_datos import OSRSBaseDatos
 from baseline import MODEL_NAME_FLAT, MODEL_NAME_MOMENTUM
-from entrenador import MODEL_NAME_HORARIO, MODEL_NAME_DIARIO, MODEL_NAME_CLASIFICADOR, MODEL_NAME_CLASIF_F2P, MODEL_NAME_CLASIF_F2P_100GP
 from metricas import filtrar_screener_liquido
 from prediccion import cargar_modelo, pronosticar_item, pronosticar_clase_item
 
 DB_PATH = 'data/osrs_ge.db'
-# Modelos con un .pkl real entrenado y precio continuo en `predicciones` —
-# únicos válidos para las tabs Predicción vs realidad y Pronóstico a futuro
-# (asumen predicted_price/actual_price en gp, no aplican al clasificador).
-MODELOS_DISPONIBLES = [MODEL_NAME_HORARIO, MODEL_NAME_DIARIO]
-# Modelos + baselines/experimentos sin .pkl productivo (baseline.py,
-# entrenador.MODEL_NAME_CLASIFICADOR con 200 ítems) — solo comparables en
-# model_metrics (tab Calidad del modelo), no tienen predicciones ni
-# pronóstico en vivo. MODEL_NAME_CLASIF_F2P_100GP es la variante productiva
-# actual del clasificador (10 ítems F2P >=100gp, Steel bar excluido — ver
-# recolector.job_horario); MODEL_NAME_CLASIF_F2P (sin filtro de precio) es
-# la variante anterior, ya no se reentrena pero se deja en la comparación
-# para ver el quiebre de performance en el gráfico de accuracy en el
-# tiempo. Ninguna de las dos entra en MODELOS_DISPONIBLES porque esas dos
-# pestañas asumen precio continuo — el clasificador tiene su propio tab
-# ("Señal direccional (F2P)" más abajo).
-MODELOS_COMPARABLES = MODELOS_DISPONIBLES + [
-    MODEL_NAME_FLAT, MODEL_NAME_MOMENTUM, MODEL_NAME_CLASIFICADOR, MODEL_NAME_CLASIF_F2P, MODEL_NAME_CLASIF_F2P_100GP,
-]
 
 
 def query(sql, params=()):
@@ -49,6 +30,40 @@ def query(sql, params=()):
     df = pd.read_sql_query(sql, conn, params=params)
     conn.close()
     return df
+
+
+def _modelos_del_usuario(tipo=None):
+    """
+    model_id de los modelos que el usuario creó en modelos_config,
+    opcionalmente filtrados por tipo ('regresor'|'clasificador').
+
+    Antes las listas de modelos de este dashboard eran constantes fijas
+    ('global_horario', 'global_diario', las variantes F2P del clasificador).
+    Esos modelos dejaron de existir cuando modelos_config pasó a arrancar
+    vacía: los selectores mostraban nombres de modelos que nadie tiene y
+    todas las pestañas caían en "no hay modelo entrenado" sin importar
+    cuántos modelos reales hubiera creado el usuario.
+    """
+    filtro = ' WHERE tipo = ?' if tipo else ''
+    params = (tipo,) if tipo else ()
+    try:
+        df = query(f'SELECT model_id FROM modelos_config{filtro} ORDER BY creado_en', params)
+    except Exception:
+        return []
+    return df['model_id'].tolist()
+
+
+# Modelos con precio continuo en `predicciones` — únicos válidos para las
+# tabs Predicción vs realidad y Pronóstico a futuro (asumen predicted_price/
+# actual_price en gp, no aplican al clasificador, que predice una clase).
+MODELOS_DISPONIBLES = _modelos_del_usuario('regresor')
+# Los de arriba + el clasificador + los baselines de baseline.py: todos
+# comparables en model_metrics (tab Calidad del modelo) porque comparten la
+# métrica de accuracy direccional, aunque el clasificador y los baselines no
+# tengan predicciones continuas ni pronóstico en vivo.
+MODELOS_COMPARABLES = MODELOS_DISPONIBLES + _modelos_del_usuario('clasificador') + [
+    MODEL_NAME_FLAT, MODEL_NAME_MOMENTUM,
+]
 
 
 @st.cache_resource
@@ -218,31 +233,45 @@ with tab_pronostico:
 
 with tab_clasificador:
     st.caption(
-        "Señal del clasificador direccional productivo (f2p10_100gp_clasif, "
-        "entrenador.entrenar_clasificador_direccional): para cada uno de los 10 ítems F2P "
-        "más líquidos con precio promedio >= 100gp (Steel bar excluido — perdía plata con "
-        "cualquier estrategia en el backtest walk-forward de 90 días), la clase más probable "
-        "del próximo período (1 hora) — baja/estable/sube — en vez de un precio continuo "
-        "reconstruido. Reentrenado cada hora junto con global_horario (ver "
-        "recolector.job_horario). A diferencia de 'Predicción vs realidad' y 'Pronóstico a "
-        "futuro' (modelo continuo, horizonte recursivo a varios pasos), acá el horizonte es "
-        "fijo a 1 paso: la inferencia se calcula en vivo acá mismo (no hay tabla de "
-        "predicciones categóricas en la DB, a propósito, para no migrar el esquema) sobre el "
-        "último dato conocido de cada ítem. Todavía no alimenta alertas.py."
+        "Señal del clasificador direccional (entrenador.entrenar_clasificador_direccional): "
+        "para cada ítem del modelo elegido, la clase más probable del próximo período — "
+        "baja/estable/sube — en vez de un precio continuo reconstruido. A diferencia de "
+        "'Predicción vs realidad' y 'Pronóstico a futuro' (modelo continuo, horizonte "
+        "recursivo a varios pasos), acá el horizonte es fijo a 1 paso: la inferencia se "
+        "calcula en vivo acá mismo (no hay tabla de predicciones categóricas en la DB, a "
+        "propósito, para no migrar el esquema) sobre el último dato conocido de cada ítem."
     )
     db_clasif = OSRSBaseDatos(DB_PATH)
-    try:
-        bundle_clasif = _modelo_cacheado(MODEL_NAME_CLASIF_F2P_100GP)
-    except FileNotFoundError:
-        bundle_clasif = None
-
-    if bundle_clasif is None:
+    clasificadores = _modelos_del_usuario('clasificador')
+    bundle_clasif = None
+    if not clasificadores:
         st.info(
-            "Todavía no hay un modelo entrenado para f2p10_100gp_clasif — esperar al próximo "
-            "job_horario o correr entrenador.py a mano."
+            "No hay ningún modelo clasificador en modelos_config — creá uno desde \"Mis "
+            "modelos\" en la app de escritorio (cada modelo nuevo crea un par "
+            "regresor+clasificador)."
         )
     else:
-        item_ids_f2p = db_clasif.obtener_top_items_liquidez(10, solo_f2p=True, precio_minimo=100, excluir_item_ids=[2353])
+        model_sel_clasif = st.selectbox("Modelo", clasificadores, key="model_tab_clasificador")
+        try:
+            bundle_clasif = _modelo_cacheado(model_sel_clasif)
+        except FileNotFoundError:
+            st.info(
+                f"'{model_sel_clasif}' todavía no tiene un .pkl entrenado — esperar al próximo "
+                "job_horario o usar \"Entrenar ahora\" en la app."
+            )
+        except ValueError as e:  # features_version desactualizada, ver prediccion.py
+            st.warning(str(e))
+
+    if bundle_clasif is not None:
+        cfg_clasif = db_clasif.obtener_modelo_config(model_sel_clasif)
+        if cfg_clasif['modo_seleccion'] == 'manual':
+            item_ids_f2p = cfg_clasif['item_ids'] or []
+        else:
+            item_ids_f2p = db_clasif.obtener_top_items_liquidez(
+                cfg_clasif['n_items'], solo_f2p=cfg_clasif['solo_f2p'],
+                precio_minimo=cfg_clasif['precio_minimo'],
+                excluir_item_ids=cfg_clasif['excluir_item_ids'],
+            )
         filas = []
         for iid in item_ids_f2p:
             resultado = pronosticar_clase_item(db_clasif, iid, bundle=bundle_clasif)

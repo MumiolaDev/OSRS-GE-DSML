@@ -35,6 +35,7 @@ El clasificador no tiene un gráfico equivalente (no persiste
 predicted_price continuo, ver el bullet de entrenador.py en CLAUDE.md) —
 se muestra un mensaje en vez de un gráfico vacío.
 """
+import math
 import re
 import sqlite3
 import time
@@ -80,13 +81,30 @@ COLUMNAS_TABLA = [
 ]
 
 
+def _margen_error_95(acc, n):
+    """
+    Semi-ancho del intervalo de confianza al 95% de una proporción
+    (aproximación normal): 1.96 * sqrt(p(1-p)/n). None si no hay muestra.
+
+    Sin esto, "57% de acierto" medido sobre 30 movimientos y sobre 30.000 se
+    mostraban igual, y el primero es indistinguible de tirar una moneda
+    (±18 puntos). El acierto direccional es una proporción binomial, así que
+    el error estándar sale directo de p y n.
+    """
+    if not n or acc is None or n <= 0:
+        return None
+    return 1.96 * math.sqrt(max(acc * (1 - acc), 0) / n)
+
+
 def _resumen_calidad(db, model_id):
     """
     Frase corta sobre qué tan bien viene funcionando el modelo, en vez de
     una tabla de métricas crudas. Se basa en accuracy_direccional de
     model_metrics (item_id IS NULL, horizonte_horas=1) -- comparable entre
-    regresor y clasificador porque entrenador.py calcula esa métrica para
-    los dos (ver entrenar_modelo_global/entrenar_clasificador_direccional).
+    regresor y clasificador porque entrenador.accuracy_direccional() es
+    ahora la MISMA función para los dos (antes cada uno usaba su propia
+    definición sobre poblaciones distintas y se guardaban en la misma
+    columna).
 
     Prioriza el PROMEDIO de todas las corridas walkforward sobre la última
     holdout: el walk-forward inicial (replay_historico.ejecutar_replay_modelo,
@@ -95,26 +113,30 @@ def _resumen_calidad(db, model_id):
     POR CHECKPOINT -- promediarlas es una lectura mucho más representativa
     que un solo split holdout, y para un modelo recién creado puede ser lo
     único que exista todavía (holdout solo se genera al usar "Entrenar
-    ahora" o en una corrida programada). Umbrales de partida, no
-    validados exhaustivamente -- mismo criterio que otros números mágicos
-    ya documentados en el proyecto (ej. UMBRAL_CLASIF_PCT en entrenador.py).
+    ahora" o en una corrida programada).
+
+    El veredicto se compara contra el AZAR (50%) usando el intervalo de
+    confianza, no contra umbrales fijos: si el intervalo incluye el 50%, la
+    respuesta honesta es "todavía no se puede afirmar nada", por más que el
+    número puntual sea 57%.
     """
     conn = sqlite3.connect(db.db_path)
     c = conn.cursor()
     c.execute(
-        '''SELECT AVG(accuracy_direccional), COUNT(*) FROM model_metrics
+        '''SELECT AVG(accuracy_direccional), COUNT(*), SUM(COALESCE(n_evaluado, 0))
+           FROM model_metrics
            WHERE model_name = ? AND item_id IS NULL AND modo_evaluacion = 'walkforward'
              AND horizonte_horas = 1 AND accuracy_direccional IS NOT NULL''',
         (model_id,),
     )
-    acc_wf, n_wf = c.fetchone()
+    acc, n_corridas, n_evaluado = c.fetchone()
 
-    if acc_wf is not None:
+    if acc is not None:
         conn.close()
-        etiqueta = f" (walk-forward, {n_wf} checkpoints)"
+        etiqueta = f" — walk-forward, {n_corridas} checkpoints, {n_evaluado or 0} movimientos"
     else:
         c.execute(
-            '''SELECT accuracy_direccional FROM model_metrics
+            '''SELECT accuracy_direccional, COALESCE(n_evaluado, 0) FROM model_metrics
                WHERE model_name = ? AND item_id IS NULL AND modo_evaluacion = 'holdout'
                  AND horizonte_horas = 1
                ORDER BY train_timestamp DESC LIMIT 1''',
@@ -124,16 +146,20 @@ def _resumen_calidad(db, model_id):
         conn.close()
         if fila is None:
             return "Sin entrenar todavía"
-        acc_wf = fila[0]
-        etiqueta = "" if acc_wf is None else " (holdout)"
+        acc, n_evaluado = fila
+        etiqueta = "" if acc is None else f" — holdout, {n_evaluado} movimientos"
 
-    if acc_wf is None:
+    if acc is None:
         return "Entrenado (sin métrica de dirección)"
-    if acc_wf >= 0.55:
-        return f"Buena señal ({acc_wf:.0%}){etiqueta}"
-    if acc_wf >= 0.48:
-        return f"Regular ({acc_wf:.0%}){etiqueta}"
-    return f"Débil, cerca del azar ({acc_wf:.0%}){etiqueta}"
+
+    margen = _margen_error_95(acc, n_evaluado)
+    if margen is None:
+        return f"Acierta la dirección {acc:.0%} de las veces{etiqueta}"
+    if acc - margen <= 0.5:
+        return f"Indistinguible del azar ({acc:.0%} ±{margen:.0%}){etiqueta}"
+    if acc - margen >= 0.55:
+        return f"Buena señal ({acc:.0%} ±{margen:.0%}){etiqueta}"
+    return f"Señal débil pero real ({acc:.0%} ±{margen:.0%}){etiqueta}"
 
 
 def _formatear_fecha(ts):
@@ -147,8 +173,10 @@ def _generar_ids_par(db, nombre):
     existe alguno de los dos -- model_id es el mismo string que
     entrenador.py usa como model_name/model_version en todo el resto del
     pipeline (ver base_de_datos.crear_modelo_config), así que tiene que
-    ser único. Prefijo 'custom_' para no poder chocar nunca con los 3
-    model_id productivos reservados (MODELOS_PROTEGIDOS). Devuelve
+    ser único. Prefijo 'custom_' para no chocar con los nombres de
+    referencia de entrenador.py (MODEL_PATHS: global_horario, global_diario,
+    las variantes del clasificador F2P), que tienen ruta de .pkl fija.
+    Devuelve
     (id_regresor, id_clasificador), siempre con el mismo sufijo -- así
     quedan visiblemente emparejados en la tabla ("mi_modelo_regresor" /
     "mi_modelo_clasificador"), no con sufijos independientes por tipo.

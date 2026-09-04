@@ -18,7 +18,6 @@ como avg_high_price - avg_low_price, no al revés.
 """
 
 import math
-import sqlite3
 import statistics
 import time
 
@@ -129,7 +128,8 @@ def margen_neto_proyectado(avg_low_price_actual, avg_high_price_actual, avg_low_
     return avg_high_price_predicho - avg_low_price_actual - impuesto
 
 
-def filtrar_screener_liquido(resumen_df, volumen_24h_minimo=100, margen_neto_minimo=None):
+def filtrar_screener_liquido(resumen_df, volumen_24h_minimo=100, margen_neto_minimo=None,
+                             antiguedad_maxima_horas=None, ahora_ts=None):
     """
     Filtra el screener (resumen_actual, o cualquier DataFrame con las mismas
     columnas) a ítems con volumen_24h >= volumen_24h_minimo (y opcionalmente
@@ -140,10 +140,22 @@ def filtrar_screener_liquido(resumen_df, volumen_24h_minimo=100, margen_neto_min
     volumen relevante en un ítem así). Usado por el dashboard (slider del
     screener), alertas.py y backtest.py — un solo filtro compartido, no una
     implementación distinta en cada uno.
+
+    antiguedad_maxima_horas (opcional): descarta ítems cuyo `ultimo_timestamp`
+    sea más viejo que eso. resumen_actual guarda el último dato DISPONIBLE de
+    cada ítem, que para un ítem poco líquido (o después de un corte del
+    recolector) puede ser de hace días — y el margen/ROI que se muestra está
+    calculado con ese precio viejo, presentado como si fuera el de ahora. La
+    columna existía desde siempre pero no la miraba nadie. None (default)
+    mantiene el comportamiento anterior; los consumidores en vivo
+    (alertas.py, la app) pasan un valor concreto.
     """
     filtrado = resumen_df[resumen_df['volumen_24h'] >= volumen_24h_minimo]
     if margen_neto_minimo is not None:
         filtrado = filtrado[filtrado['margen_neto'] >= margen_neto_minimo]
+    if antiguedad_maxima_horas is not None and 'ultimo_timestamp' in filtrado.columns:
+        ahora = ahora_ts if ahora_ts is not None else int(time.time())
+        filtrado = filtrado[filtrado['ultimo_timestamp'] >= ahora - antiguedad_maxima_horas * 3600]
     return filtrado.reset_index(drop=True)
 
 
@@ -180,9 +192,14 @@ def percentil_historico(precio_actual, serie_precios):
 
 
 def tendencia_volumen(serie_volumen, ventana_reciente=6):
-    """Volumen promedio de las últimas `ventana_reciente` horas dividido por
-    el promedio del resto de la serie. >1 = el volumen está subiendo
-    (posible señal de que algo le está pasando al ítem)."""
+    """Volumen promedio de los últimos `ventana_reciente` PERÍODOS dividido
+    por el promedio del resto de la serie. >1 = el volumen está subiendo
+    (posible señal de que algo le está pasando al ítem).
+
+    A diferencia de volumen_24h/pct_cambio_24h (que ya se calculan sobre
+    horas de reloj, ver _ventana), esto sigue siendo por cantidad de filas:
+    es una comparación relativa "reciente vs. resto", donde el sesgo de un
+    hueco de datos afecta a las dos mitades por igual."""
     if len(serie_volumen) < ventana_reciente + 1:
         return None
     reciente = statistics.fmean(serie_volumen[-ventana_reciente:])
@@ -192,8 +209,22 @@ def tendencia_volumen(serie_volumen, ventana_reciente=6):
     return reciente / resto
 
 
+def _ventana(df, columna, ultimo_ts, horas):
+    """Sub-serie de `df` (ordenado por timestamp) de las últimas `horas`
+    HORAS DE RELOJ terminando en `ultimo_ts`, como lista.
+
+    Antes estas ventanas se tomaban con `lista[-24:]`, o sea "las últimas 24
+    FILAS disponibles". Para un ítem sin huecos da lo mismo, pero para uno
+    poco líquido (o después de un corte del recolector) esas 24 filas pueden
+    abarcar días: el "volumen de 24h" sumaba entonces el volumen de varios
+    días y sobreestimaba la liquidez justo en los ítems donde el filtro de
+    liquidez es lo único que evita mostrar un ROI absurdo."""
+    corte = ultimo_ts - horas * 3600
+    return df.loc[df['timestamp'] > corte, columna].tolist()
+
+
 # ---------------------------------------------------------------------------
-def calcular_resumen_item(db, item_id, nombre, buy_limit, tabla='precios_1h', horas_historial=720, ahora_ts=None):
+def calcular_resumen_item(db, item_id, nombre, buy_limit, tabla='precios_1h', horas_historial=720, ahora_ts=None, df=None):
     """Calcula el set completo de métricas para un ítem, usando hasta
     `horas_historial` horas más recientes de su historial (default 720h =
     30 días) para percentil/volatilidad/tendencia.
@@ -201,14 +232,19 @@ def calcular_resumen_item(db, item_id, nombre, buy_limit, tabla='precios_1h', ho
     ahora_ts (opcional): en vez de usar el reloj real, calcula el resumen
     "como si fuera" este momento — usado por el replay histórico
     (replay_historico.py) para simular qué habría mostrado el screener en
-    un punto del pasado, sin ver datos posteriores ya backfilleados."""
+    un punto del pasado, sin ver datos posteriores ya backfilleados.
+
+    df (opcional): el historial del ítem ya traído por el llamador, para no
+    hacer una query por ítem (ver calcular_resumen_todos). Si no se pasa, se
+    consulta acá como siempre."""
     # Filtra por fecha en la query SQL (desde_timestamp/hasta_timestamp) en
     # vez de traer todo el historial del ítem y recortar después con
     # .tail() en pandas — con meses de datos acumulados, traer todo en cada
     # refresh del screener se vuelve cada vez más lento.
     ahora = ahora_ts if ahora_ts is not None else int(time.time())
-    desde = ahora - horas_historial * 3600
-    df = db.obtener_precios_id(item_id, tabla, desde_timestamp=desde, hasta_timestamp=ahora_ts)
+    if df is None:
+        desde = ahora - horas_historial * 3600
+        df = db.obtener_precios_id(item_id, tabla, desde_timestamp=desde, hasta_timestamp=ahora_ts)
     if df.empty:
         return None
 
@@ -220,34 +256,41 @@ def calcular_resumen_item(db, item_id, nombre, buy_limit, tabla='precios_1h', ho
     high, low = ultimo['avg_high_price'], ultimo['avg_low_price']
     if not high or not low:
         return None
+    ultimo_ts = int(ultimo['timestamp'])
 
     margen = calcular_margen(int(high), int(low), item_id)
     profit_potencial = calcular_profit_potencial(margen['margen_neto'], buy_limit)
 
-    precios_medios = ((df['avg_high_price'] + df['avg_low_price']) / 2).tolist()
-    volumenes = (df['high_volume'] + df['low_volume']).tolist()
-
-    def ultimas(n):
-        # ventanas en "horas de historial disponible", no de reloj —
-        # si el ítem tiene huecos de datos esto no corrige por eso.
-        return precios_medios[-n:] if len(precios_medios) >= n else precios_medios
+    df = df.assign(
+        precio_medio=(df['avg_high_price'] + df['avg_low_price']) / 2,
+        volumen_total=df['high_volume'] + df['low_volume'],
+    )
+    precios_medios = df['precio_medio'].tolist()
+    volumenes = df['volumen_total'].tolist()
 
     return {
         'item_id': int(item_id),
         'name': nombre,
-        'ultimo_timestamp': int(ultimo['timestamp']),
+        'ultimo_timestamp': ultimo_ts,
         'avg_high_price': int(high),
         'avg_low_price': int(low),
         **margen,
         'profit_potencial_4h': profit_potencial,
-        'pct_cambio_24h': pct_cambio(ultimas(24)),
-        'pct_cambio_7d': pct_cambio(ultimas(24 * 7)),
+        'pct_cambio_24h': pct_cambio(_ventana(df, 'precio_medio', ultimo_ts, 24)),
+        'pct_cambio_7d': pct_cambio(_ventana(df, 'precio_medio', ultimo_ts, 24 * 7)),
         'volatilidad_30d_pct': volatilidad(precios_medios),
         'percentil_30d': percentil_historico(precios_medios[-1], precios_medios),
-        'volumen_24h': int(sum(volumenes[-24:])),
+        'volumen_24h': int(sum(_ventana(df, 'volumen_total', ultimo_ts, 24))),
         'tendencia_volumen': tendencia_volumen(volumenes),
         'n_horas_historial': len(df),
     }
+
+
+# Cuántos ítems se traen por query en calcular_resumen_todos. Con ~4.600
+# ítems y 30 días de historial horario, traer todo de una son ~3M de filas en
+# memoria; de a 500 el pico queda en un orden de magnitud menos sin volver a
+# caer en una query por ítem.
+ITEMS_POR_LOTE = 500
 
 
 def calcular_resumen_todos(db, tabla='precios_1h', horas_historial=720, ahora_ts=None):
@@ -255,11 +298,21 @@ def calcular_resumen_todos(db, tabla='precios_1h', horas_historial=720, ahora_ts
     Devuelve una lista de dicts (una fila por ítem con datos suficientes),
     lista para pasarse a OSRSBaseDatos.guardar_resumen().
 
+    Trae el historial en lotes de ITEMS_POR_LOTE ítems con una sola query
+    (obtener_precios_multi) en vez de una consulta —y una conexión SQLite—
+    por ítem. Esto corre en cada job_horario sobre TODOS los ítems del juego
+    con datos: eran ~1.600 conexiones por corrida con la DB casi vacía y
+    serían ~4.600 con la DB llena, además de bloquear el reentrenamiento
+    (job_horario aborta si esto falla).
+
     ahora_ts (opcional): propagado a calcular_resumen_item para simular un
     momento del pasado (replay histórico); también acota acá el universo de
     ítems candidatos a los que ya tenían datos hasta ese momento — sin esto,
     un ítem con datos solo posteriores a ahora_ts aparecería igual."""
-    conn = sqlite3.connect(db.db_path)
+    ahora = ahora_ts if ahora_ts is not None else int(time.time())
+    desde = ahora - horas_historial * 3600
+
+    conn = db.conectar()
     c = conn.cursor()
     query = f'''
         SELECT DISTINCT p.item_id, i.name, i.buy_limit
@@ -274,10 +327,22 @@ def calcular_resumen_todos(db, tabla='precios_1h', horas_historial=720, ahora_ts
     conn.close()
 
     resultados = []
-    for item_id, nombre, buy_limit in candidatos:
-        fila = calcular_resumen_item(db, item_id, nombre, buy_limit, tabla, horas_historial, ahora_ts=ahora_ts)
-        if fila:
-            resultados.append(fila)
+    for inicio in range(0, len(candidatos), ITEMS_POR_LOTE):
+        lote = candidatos[inicio:inicio + ITEMS_POR_LOTE]
+        precios = db.obtener_precios_multi(
+            [item_id for item_id, _, _ in lote], tabla,
+            desde_timestamp=desde, hasta_timestamp=ahora_ts,
+        )
+        por_item = dict(tuple(precios.groupby('item_id'))) if not precios.empty else {}
+        for item_id, nombre, buy_limit in lote:
+            df_item = por_item.get(item_id)
+            if df_item is None:
+                continue
+            fila = calcular_resumen_item(
+                db, item_id, nombre, buy_limit, tabla, horas_historial, ahora_ts=ahora_ts, df=df_item,
+            )
+            if fila:
+                resultados.append(fila)
     return resultados
 
 

@@ -41,7 +41,7 @@ recolector.py, no en cada arranque.
 import logging
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Ventanas de retención por tabla de precios, en un solo lugar — tanto
 # ejecutar_mantenimiento_semanal() (purga/agregación) como
@@ -69,8 +69,15 @@ def archivar_datos_antiguos(db, tabla='precios_1h', tabla_diaria='precios_1h_dia
     (ej. mensual) para eso — puede tardar y bloquea la DB mientras corre, no
     conviene meterlo en este job.
     """
-    corte = int(time.time()) - dias_retencion * 86400
     segundos_dia = 86400
+    # El corte se alinea hacia ABAJO al inicio del día UTC: si se cortara en
+    # un punto intermedio (ej. las 14:37 de hace 90 días), el día del borde
+    # se archivaría con el promedio de sus primeras 14 horas y después se
+    # borraría de precios_1h — y la corrida de la semana siguiente, que sí
+    # vería el día completo, no podría corregirlo porque INSERT OR IGNORE
+    # respeta la fila parcial ya escrita en (item_id, fecha). Así solo se
+    # archivan días enteros, y el día del borde espera un día más.
+    corte = ((int(time.time()) - dias_retencion * 86400) // segundos_dia) * segundos_dia
 
     conn = sqlite3.connect(db.db_path)
     c = conn.cursor()
@@ -178,7 +185,7 @@ def backfill_archivo_diario(db, desde_ts, hasta_ts, dias_por_lote=7, delay=1.0):
         lote_fin = min(lote_inicio + paso_lote - 3600, hasta_ts)
         logging.info(
             f"backfill_archivo_diario: lote {n_lotes + 1} "
-            f"[{datetime.utcfromtimestamp(lote_inicio)} - {datetime.utcfromtimestamp(lote_fin)}]"
+            f"[{datetime.fromtimestamp(lote_inicio, timezone.utc)} - {datetime.fromtimestamp(lote_fin, timezone.utc)}]"
         )
         backfill_faltantes('1h', lote_inicio, lote_fin, db, delay=delay)
 

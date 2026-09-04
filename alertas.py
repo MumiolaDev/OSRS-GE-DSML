@@ -20,11 +20,35 @@ import pandas as pd
 import requests
 
 import configuracion
-from entrenador import MODEL_NAME_HORARIO
 from metricas import filtrar_screener_liquido, margen_neto_proyectado
 from prediccion import cargar_modelo, pronosticar_item
 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+
+# Un dato de precio más viejo que esto no describe el mercado "de ahora":
+# alertar con él es mandar una oportunidad que puede haber desaparecido hace
+# rato. Con recolección horaria sana, `ultimo_timestamp` nunca debería
+# quedar a más de un par de horas (ver recolector._ultimo_bucket_cerrado).
+ANTIGUEDAD_MAXIMA_HORAS = 6
+
+
+def _modelo_regresor_activo(db):
+    """
+    model_id del regresor activo más reciente de modelos_config, o None si el
+    usuario todavía no creó ninguno.
+
+    Antes esto era la constante MODEL_NAME_HORARIO ('global_horario'), que
+    dejó de existir cuando modelos_config pasó a arrancar vacía: el resultado
+    era un warning "no se pudo cargar el modelo 'global_horario'" en CADA
+    corrida de job_horario, y las alertas nunca llevaban señal del modelo por
+    más modelos que el usuario hubiera creado.
+    """
+    regresores = [
+        m for m in db.listar_modelos_config(estado='activo') if m['tipo'] == 'regresor'
+    ]
+    if not regresores:
+        return None
+    return max(regresores, key=lambda m: m['creado_en'] or 0)['model_id']
 
 
 def enviar_mensaje_telegram(texto, token=None, chat_id=None):
@@ -105,9 +129,9 @@ def evaluar_alertas(
     todos los candidatos que pasan el filtro en UN solo mensaje Telegram,
     no uno por ítem.
     """
-    model_name = model_name or MODEL_NAME_HORARIO
+    model_name = model_name or _modelo_regresor_activo(db)
 
-    conn = sqlite3.connect(db.db_path)
+    conn = db.conectar()
     resumen = pd.read_sql_query(
         'SELECT r.*, i.buy_limit FROM resumen_actual r JOIN items i ON i.item_id = r.item_id', conn,
     )
@@ -116,7 +140,10 @@ def evaluar_alertas(
         logging.info("alertas.py: resumen_actual vacía, nada que evaluar.")
         return
 
-    candidatos_df = filtrar_screener_liquido(resumen, volumen_24h_minimo=volumen_24h_minimo)
+    candidatos_df = filtrar_screener_liquido(
+        resumen, volumen_24h_minimo=volumen_24h_minimo,
+        antiguedad_maxima_horas=ANTIGUEDAD_MAXIMA_HORAS,
+    )
     candidatos_df = candidatos_df[candidatos_df['roi_pct'] >= umbral_roi_pct]
     candidatos_df = candidatos_df.sort_values('margen_neto', ascending=False).head(top_n)
 
@@ -125,10 +152,20 @@ def evaluar_alertas(
         return
 
     bundle = None
-    try:
-        bundle = cargar_modelo(model_name=model_name)
-    except Exception as e:
-        logging.warning(f"alertas.py: no se pudo cargar el modelo '{model_name}', se omite la señal del modelo: {e}")
+    if model_name is None:
+        logging.info(
+            "alertas.py: no hay ningún modelo regresor activo en modelos_config — se alerta solo "
+            "con el screener, sin señal de modelo."
+        )
+    else:
+        try:
+            bundle = cargar_modelo(model_name=model_name)
+        except FileNotFoundError:
+            logging.info(
+                f"alertas.py: '{model_name}' todavía no tiene un .pkl entrenado, se omite la señal del modelo."
+            )
+        except Exception as e:
+            logging.warning(f"alertas.py: no se pudo cargar el modelo '{model_name}', se omite la señal del modelo: {e}")
 
     ahora = int(time.time())
     candidatos_a_enviar = []
@@ -149,7 +186,10 @@ def evaluar_alertas(
         margen_proyectado_modelo = None
         if bundle is not None:
             try:
-                pronostico = pronosticar_item(db, item_id, bundle, n_pasos=horizonte_horas, tabla='precios_1h')
+                # Sin `tabla=`: la granularidad sale del bundle (con cuál se
+                # entrenó ese modelo), forzar 'precios_1h' acá le daba
+                # features de otra escala temporal a un modelo de 5m/6h.
+                pronostico = pronosticar_item(db, item_id, bundle, n_pasos=horizonte_horas)
                 if not pronostico.empty:
                     pred_price = pronostico.iloc[-1]['predicted_price']
                     margen_proyectado_modelo = margen_neto_proyectado(

@@ -45,13 +45,12 @@ def evaluar_horizontes(db, bundle, puntos_eval, n_pasos=6, tabla='precios_1h'):
         por_item.setdefault(int(item_id), []).append(int(ts))
 
     filas = []
+    conn = sqlite3.connect(db.db_path)
     for item_id, puntos in por_item.items():
-        conn = sqlite3.connect(db.db_path)
         real = pd.read_sql_query(
             f'SELECT timestamp, {target_col} AS precio FROM {tabla} WHERE item_id = ?',
             conn, params=[item_id],
         )
-        conn.close()
         if real.empty:
             continue
         real = real.set_index('timestamp')['precio']
@@ -85,14 +84,24 @@ def evaluar_horizontes(db, bundle, puntos_eval, n_pasos=6, tabla='precios_1h'):
                     # con el cual compararse — se omite, no es un error.
                     continue
                 precio_real = float(real.loc[ts_pred])
+                # acierto_direccional queda en None (no True/False) cuando
+                # el precio real no se movió respecto del punto de partida:
+                # no hay dirección que acertar, y contarlo como fallo es lo
+                # que hundía artificialmente la métrica del regresor (ver
+                # entrenador.accuracy_direccional). Quien agrega estas filas
+                # descarta los None antes de promediar.
+                movimiento_real = np.sign(precio_real - precio_actual)
+                acierto = (
+                    None if movimiento_real == 0
+                    else bool(movimiento_real == np.sign(fila['predicted_price'] - precio_actual))
+                )
                 filas.append({
                     'item_id': item_id,
                     'horizonte': int(fila['paso']),
                     'error_abs': abs(precio_real - fila['predicted_price']),
-                    'acierto_direccional': bool(
-                        np.sign(precio_real - precio_actual) == np.sign(fila['predicted_price'] - precio_actual)
-                    ),
+                    'acierto_direccional': acierto,
                 })
+    conn.close()
 
     if not filas:
         logging.warning("evaluar_horizontes: ningún punto de evaluación tenía precio real posterior disponible.")

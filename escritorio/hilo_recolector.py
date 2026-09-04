@@ -78,12 +78,9 @@ class HiloRecolector(QThread):
         # Recolección inicial, un mensaje por cadencia (antes era un solo
         # "Recolectando datos iniciales..." que no distinguía cuál de las
         # tres estaba en curso).
-        self.estado_cambio.emit("Recolectando 5m inicial...")
-        recolector.collect_5min(db)
-        self.estado_cambio.emit("Recolectando 1h inicial...")
-        recolector.collect_1h(db)
-        self.estado_cambio.emit("Recolectando 6h inicial...")
-        recolector.collect_6h(db)
+        for intervalo in ('5m', '1h', '6h'):
+            self.estado_cambio.emit(f"Recolectando {intervalo} inicial...")
+            recolector.collect_programado(db, intervalo)
 
         if self._detener:
             self.estado_cambio.emit("Detenido")
@@ -126,11 +123,21 @@ class HiloRecolector(QThread):
         # HiloRecolector nuevo en cada "Iniciar", pero todos comparten el
         # scheduler global por default de la librería `schedule`, el mismo
         # que usa recolector.py.__main__).
+        # Mismo esquema que recolector.py.__main__: collect_programado pide
+        # explícitamente los buckets cerrados que falten (ver
+        # recolector._ultimo_bucket_cerrado) y corre un minuto después del
+        # cierre, no en el instante exacto.
         schedule.clear()
-        recolector._programar_cada_n_minutos_alineado(5, self._con_notificacion("5m", recolector.collect_5min), db)
-        schedule.every().hour.at(":00", "UTC").do(self._con_notificacion("1h", recolector.collect_1h), db)
+        recolector._programar_cada_n_minutos_alineado(
+            5, self._con_notificacion("5m", recolector.collect_programado), db, '5m', offset_minutos=1,
+        )
+        schedule.every().hour.at(":01", "UTC").do(
+            self._con_notificacion("1h", recolector.collect_programado), db, '1h',
+        )
         for h in (0, 6, 12, 18):
-            schedule.every().day.at(f"{h:02d}:00", "UTC").do(self._con_notificacion("6h", recolector.collect_6h), db)
+            schedule.every().day.at(f"{h:02d}:01", "UTC").do(
+                self._con_notificacion("6h", recolector.collect_programado), db, '6h',
+            )
         schedule.every().hour.at(":05", "UTC").do(self._con_notificacion("resumen y modelos (job horario)", recolector.job_horario), db)
         schedule.every().day.at("03:00", "UTC").do(self._con_notificacion("modelos (job diario)", recolector.job_diario), db)
         schedule.every().sunday.at("04:00", "UTC").do(self._con_notificacion("mantenimiento semanal", recolector.job_semanal), db)

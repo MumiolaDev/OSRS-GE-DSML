@@ -9,6 +9,7 @@ import math
 import pandas as pd
 import pytest
 
+import metricas
 from metricas import (
     calcular_impuesto_ge,
     calcular_margen,
@@ -181,3 +182,52 @@ class TestFiltrarScreenerLiquido:
             self._resumen(), volumen_24h_minimo=100, margen_neto_minimo=0,
         )
         assert set(filtrado['item_id']) == {2}
+
+    def _resumen_con_antiguedad(self, ahora):
+        return pd.DataFrame([
+            {'item_id': 1, 'volumen_24h': 500, 'margen_neto': 5, 'roi_pct': 2.0,
+             'ultimo_timestamp': ahora - 3600},          # 1 hora: fresco
+            {'item_id': 2, 'volumen_24h': 500, 'margen_neto': 5, 'roi_pct': 2.0,
+             'ultimo_timestamp': ahora - 3 * 86400},     # 3 días: viejo
+        ])
+
+    def test_filtra_datos_viejos_cuando_se_pide(self):
+        """resumen_actual guarda el último dato DISPONIBLE de cada ítem: para
+        uno poco líquido, o después de un corte del recolector, el margen que
+        muestra está calculado con un precio de hace días y se presenta como
+        si fuera el de ahora."""
+        ahora = 1_700_000_000
+        filtrado = filtrar_screener_liquido(
+            self._resumen_con_antiguedad(ahora), volumen_24h_minimo=100,
+            antiguedad_maxima_horas=6, ahora_ts=ahora,
+        )
+        assert set(filtrado['item_id']) == {1}
+
+    def test_sin_el_parametro_no_filtra_por_antiguedad(self):
+        ahora = 1_700_000_000
+        filtrado = filtrar_screener_liquido(
+            self._resumen_con_antiguedad(ahora), volumen_24h_minimo=100,
+        )
+        assert set(filtrado['item_id']) == {1, 2}
+
+
+class TestVentanaPorTiempo:
+    """_ventana toma horas de RELOJ, no las últimas N filas: para un ítem con
+    huecos, 24 filas pueden abarcar días y el 'volumen de 24h' terminaba
+    sumando el de varios, sobrestimando la liquidez justo donde el filtro de
+    liquidez es lo único que evita mostrar un ROI absurdo."""
+
+    def _serie_con_hueco(self):
+        # 3 filas dentro de las últimas 24h y 3 de hace más de una semana
+        ultimo = 1_700_000_000
+        timestamps = [ultimo - 8 * 86400, ultimo - 7 * 86400, ultimo - 6 * 86400,
+                      ultimo - 2 * 3600, ultimo - 3600, ultimo]
+        return pd.DataFrame({'timestamp': timestamps, 'volumen_total': [100] * 6}), ultimo
+
+    def test_solo_cuenta_lo_que_cae_en_la_ventana(self):
+        df, ultimo = self._serie_con_hueco()
+        assert sum(metricas._ventana(df, 'volumen_total', ultimo, 24)) == 300
+
+    def test_la_version_por_filas_habria_sumado_todo(self):
+        df, _ = self._serie_con_hueco()
+        assert sum(df['volumen_total'].tolist()[-24:]) == 600

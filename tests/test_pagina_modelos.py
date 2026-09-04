@@ -18,7 +18,9 @@ import time
 import pytest
 
 from base_de_datos import OSRSBaseDatos
-from escritorio.paginas.pagina_modelos import _formatear_fecha, _generar_ids_par, _resumen_calidad
+from escritorio.paginas.pagina_modelos import (
+    _formatear_fecha, _generar_ids_par, _margen_error_95, _resumen_calidad,
+)
 
 
 @pytest.fixture
@@ -87,16 +89,36 @@ class TestGenerarIdsPar:
         assert segundo_clas == 'custom_prueba_1_clasificador'
 
 
+class TestMargenError95:
+    """El veredicto de calidad ya no sale de umbrales fijos sobre la
+    accuracy puntual sino de compararla contra el azar con su intervalo de
+    confianza — lo que exige saber sobre cuántas observaciones se midió
+    (model_metrics.n_evaluado)."""
+
+    def test_sin_muestra_no_hay_margen(self):
+        assert _margen_error_95(0.6, 0) is None
+        assert _margen_error_95(None, 100) is None
+
+    def test_mas_muestra_achica_el_margen(self):
+        chico = _margen_error_95(0.6, 30)
+        grande = _margen_error_95(0.6, 30_000)
+        assert chico > grande
+        # 30 observaciones dan ±17 puntos: 60% no se distingue de una moneda
+        assert chico > 0.15
+        assert grande < 0.01
+
+
 class TestResumenCalidad:
-    def _insertar_metrica(self, db, model_id, accuracy, train_ts=None):
+    def _insertar_metrica(self, db, model_id, accuracy, train_ts=None, n_evaluado=1000,
+                          modo='holdout'):
         conn = sqlite3.connect(db.db_path)
         c = conn.cursor()
         c.execute(
             '''INSERT INTO model_metrics
                 (item_id, train_timestamp, model_name, mae, rmse,
-                 horizonte_horas, accuracy_direccional, modo_evaluacion)
-               VALUES (NULL, ?, ?, 0.01, 0.02, 1, ?, 'holdout')''',
-            (train_ts or int(time.time()), model_id, accuracy),
+                 horizonte_horas, accuracy_direccional, modo_evaluacion, n_evaluado)
+               VALUES (NULL, ?, ?, 0.01, 0.02, 1, ?, ?, ?)''',
+            (train_ts or int(time.time()), model_id, accuracy, modo, n_evaluado),
         )
         conn.commit()
         conn.close()
@@ -112,16 +134,31 @@ class TestResumenCalidad:
         self._insertar_metrica(db, 'modelo_x', 0.60)
         assert "Buena señal" in _resumen_calidad(db, 'modelo_x')
 
-    def test_regular(self, db):
+    def test_al_azar(self, db):
         self._insertar_metrica(db, 'modelo_x', 0.50)
-        assert "Regular" in _resumen_calidad(db, 'modelo_x')
+        assert "Indistinguible del azar" in _resumen_calidad(db, 'modelo_x')
 
-    def test_debil(self, db):
+    def test_peor_que_el_azar_tambien_es_indistinguible_o_peor(self, db):
         self._insertar_metrica(db, 'modelo_x', 0.40)
-        assert "Débil" in _resumen_calidad(db, 'modelo_x')
+        assert "Indistinguible del azar" in _resumen_calidad(db, 'modelo_x')
+
+    def test_accuracy_alta_con_muestra_chica_no_se_declara_buena(self, db):
+        """El caso que motivó el cambio: 60% sobre 20 movimientos entra
+        dentro del ruido de una moneda, y antes se mostraba igual que 60%
+        sobre 20.000."""
+        self._insertar_metrica(db, 'modelo_x', 0.60, n_evaluado=20)
+        assert "Indistinguible del azar" in _resumen_calidad(db, 'modelo_x')
 
     def test_usa_la_corrida_mas_reciente(self, db):
         ahora = int(time.time())
         self._insertar_metrica(db, 'modelo_x', 0.30, train_ts=ahora - 3600)
         self._insertar_metrica(db, 'modelo_x', 0.90, train_ts=ahora)
         assert "Buena señal" in _resumen_calidad(db, 'modelo_x')
+
+    def test_walkforward_tiene_prioridad_sobre_holdout(self, db):
+        ahora = int(time.time())
+        self._insertar_metrica(db, 'modelo_x', 0.90, train_ts=ahora, modo='holdout')
+        self._insertar_metrica(db, 'modelo_x', 0.52, train_ts=ahora, modo='walkforward')
+        resumen = _resumen_calidad(db, 'modelo_x')
+        assert "walk-forward" in resumen
+        assert "52%" in resumen

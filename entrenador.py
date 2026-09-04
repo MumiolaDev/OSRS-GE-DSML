@@ -8,7 +8,8 @@ from xgboost import XGBRegressor, XGBClassifier
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from base_de_datos import OSRSBaseDatos
-from preprocesamiento import build_training_set
+from metricas import GE_TAX_RATE
+from preprocesamiento import build_training_set, FEATURES_VERSION, PASO_SEGUNDOS_POR_TABLA
 
 MODEL_DIR = "models"
 
@@ -43,7 +44,28 @@ MODEL_NAME_DIARIO = "global_diario"
 MODEL_NAME_CLASIFICADOR = "global_horario_clasif"
 MODEL_NAME_CLASIF_F2P = "f2p10_clasif"
 MODEL_NAME_CLASIF_F2P_100GP = "f2p10_100gp_clasif"
-UMBRAL_CLASIF_PCT = 0.5  # log-retorno %: |retorno| > esto para no contar como "estable"
+
+# Costo mínimo de un round-trip que NO captura el spread: el impuesto del
+# Grand Exchange sobre la venta (metricas.GE_TAX_RATE). Un movimiento
+# predicho por debajo de esto no alcanza para cubrir el impuesto, así que
+# comprar por esa señal es perder plata salvo que además se capture el
+# spread (comprar con orden en la punta baja y vender en la alta, con las
+# dos órdenes efectivamente completadas — ver el docstring de backtest.py).
+UMBRAL_COSTO_PCT = GE_TAX_RATE * 100
+
+# log-retorno %: |retorno| > esto para no contar como "estable".
+# Subido de 0.5 a 1.0 después de medir la distribución real: el movimiento
+# horario MEDIANO de los ítems líquidos está entre 0.2% y 0.9% según el ítem,
+# así que con 0.5% la mitad de las clases 'sube'/'baja' eran ruido de
+# redondeo del precio entero, y ninguna de ellas cubría el 2% de impuesto.
+# 1.0% es un compromiso: sigue por debajo del costo (ver UMBRAL_COSTO_PCT y
+# el warning de _avisar_umbral_vs_costo) pero deja suficientes ejemplos de
+# cada clase para que el clasificador aprenda algo — subirlo hasta 2% deja
+# entre 1% y 10% de las horas como movimiento, y el modelo colapsa a
+# predecir 'estable' siempre. Que la señal cubra el costo es una decisión
+# del punto de consumo (cruzarla con margen_neto del screener), no del
+# etiquetado.
+UMBRAL_CLASIF_PCT = 1.0
 # 0=baja, 1=estable, 2=sube (ver _clasificar_retorno) — centralizado acá para
 # que prediccion.py/dashboard.py no repitan los mismos números mágicos.
 CLASE_LABELS = {0: 'baja', 1: 'estable', 2: 'sube'}
@@ -64,6 +86,74 @@ N_MUESTRAS_HORIZONTE = 200
 # (lags, medias móviles, encoding de tiempo, item_id, buy_limit, members) se
 # usa como entrada del modelo.
 NON_FEATURE_COLS = ['timestamp_target', 'price_actual', 'price_target', 'target']
+
+# Dirección asociada a cada clase del clasificador (ver CLASE_LABELS):
+# 'estable' es 0, o sea "no me juego por ninguna dirección".
+_DIRECCION_POR_CLASE = {0: -1, 1: 0, 2: 1}
+
+
+def accuracy_direccional(target_real, direccion_predicha, umbral_pct=UMBRAL_CLASIF_PCT):
+    """
+    Fracción de aciertos de DIRECCIÓN sobre los períodos en que el precio
+    efectivamente se movió (|log-retorno real| > umbral_pct%).
+
+    Definición única y compartida entre el regresor y el clasificador — sin
+    esto las dos métricas se guardaban en la misma columna de model_metrics
+    calculadas sobre poblaciones distintas, y no eran comparables:
+
+    - El regresor usaba `sign(pred) == sign(real)` sobre TODAS las filas. En
+      los períodos sin movimiento el retorno real es exactamente 0 (entre el
+      7% y el 35% de las horas según el ítem, medido sobre datos reales:
+      los precios son enteros y muchos ítems no se mueven en una hora), su
+      signo es 0, y el modelo nunca predice exactamente 0 — así que TODOS
+      esos empates contaban como error. Medido: la misma corrida daba 31.7%
+      con esa fórmula y 55.9% con esta.
+    - El clasificador excluía los casos 'estable' tanto reales como
+      predichos, lo que además de cambiar la población le regalaba los casos
+      en que se abstenía.
+
+    Acá los períodos sin movimiento real quedan fuera de la cuenta (no hay
+    dirección que acertar), pero abstenerse cuando SÍ hubo movimiento cuenta
+    como error: el modelo tuvo la oportunidad y no la vio.
+
+    `direccion_predicha` puede ser un retorno continuo (regresor, se usa su
+    signo) o ya un -1/0/+1. Devuelve (accuracy, n_evaluado); accuracy es
+    None si no hubo ningún movimiento por encima del umbral.
+    """
+    target_real = np.asarray(target_real, dtype=float)
+    direccion_predicha = np.asarray(direccion_predicha, dtype=float)
+    umbral = umbral_pct / 100
+
+    hubo_movimiento = np.abs(target_real) > umbral
+    n = int(hubo_movimiento.sum())
+    if n == 0:
+        return None, 0
+    aciertos = np.sign(direccion_predicha[hubo_movimiento]) == np.sign(target_real[hubo_movimiento])
+    return float(aciertos.mean()), n
+
+
+def _direcciones_desde_clases(clases):
+    """Convierte las clases 0/1/2 del clasificador en -1/0/+1 para poder
+    pasárselas a accuracy_direccional() con la misma semántica que el
+    retorno continuo del regresor."""
+    return np.array([_DIRECCION_POR_CLASE[int(c)] for c in clases], dtype=float)
+
+
+def _avisar_umbral_vs_costo(model_name, umbral_pct):
+    """
+    Loguea un warning si el umbral con el que se etiquetan las clases del
+    clasificador queda por debajo del costo del impuesto GE — sus señales
+    'sube' no cubren el costo de operar salvo que además se capture el
+    spread. No cambia el entrenamiento: es una decisión del usuario, pero
+    tiene que ser visible y no un default silencioso (ver UMBRAL_COSTO_PCT).
+    """
+    if umbral_pct < UMBRAL_COSTO_PCT:
+        logging.warning(
+            f"[{model_name}] umbral_pct={umbral_pct}% < {UMBRAL_COSTO_PCT}% de impuesto GE: "
+            "una señal 'sube' de esa magnitud no cubre el impuesto de la venta por sí sola — "
+            "solo es rentable si además se captura el spread (cruzarla con margen_neto del "
+            "screener antes de operar)."
+        )
 
 
 def entrenar_modelo_global(
@@ -228,14 +318,23 @@ def entrenar_modelo_global(
     mae_retorno = mean_absolute_error(y_test, y_pred)
     rmse_retorno = np.sqrt(mean_squared_error(y_test, y_pred))
     mae_gp = mean_absolute_error(test['price_target'], test['pred_price'])
-    # Accuracy direccional: de los movimientos que el modelo predijo, ¿en
-    # qué fracción acertó el signo (sube/baja), más allá de si acertó la
-    # magnitud? Es la pregunta que de verdad importa para decidir si vale
-    # comprar o vender, y que hasta ahora no se medía en ningún lado.
-    acc_direccional = float((np.sign(test['pred_target']) == np.sign(test['target'])).mean())
+    rmse_gp = np.sqrt(mean_squared_error(test['price_target'], test['pred_price']))
+    # Accuracy direccional: de los períodos en que el precio SE MOVIÓ, ¿en
+    # qué fracción acertó el signo, más allá de la magnitud? Es la pregunta
+    # que de verdad importa para decidir si vale comprar o vender. Ver
+    # accuracy_direccional() sobre por qué los períodos sin movimiento no
+    # entran en la cuenta (antes contaban todos como error).
+    acc_direccional, n_direccional = accuracy_direccional(test['target'], test['pred_target'])
+    # Piso de referencia obligado: el error del baseline trivial "el precio
+    # no cambia" sobre el mismo test set. Si el modelo no le gana a esto,
+    # está agregando ruido y conviene saberlo en el log, no descubrirlo
+    # después en el dashboard (ver baseline.py).
+    mae_flat = float(np.abs(y_test).mean())
     logging.info(
-        f"[{model_name}] MAE retorno (log): {mae_retorno:.5f} | RMSE retorno (log): {rmse_retorno:.5f} | "
-        f"MAE reconstruido: {mae_gp:.2f} gp | accuracy direccional: {acc_direccional:.3f}"
+        f"[{model_name}] MAE retorno (log): {mae_retorno:.5f} (baseline 'no cambia': {mae_flat:.5f}"
+        f"{' — el modelo NO le gana' if mae_retorno >= mae_flat else ''}) | "
+        f"MAE reconstruido: {mae_gp:.2f} gp | accuracy direccional: "
+        f"{'N/A' if acc_direccional is None else f'{acc_direccional:.3f}'} sobre {n_direccional} movimientos"
     )
 
     # Se guarda un bundle (no solo el modelo): XGBoost, con enable_categorical,
@@ -255,6 +354,12 @@ def entrenar_modelo_global(
         'tabla': tabla,
         'lags': 5,
         'ma_windows': [3, 6],
+        # Ver preprocesamiento.FEATURES_VERSION: prediccion.py lo verifica
+        # antes de inferir. Un bundle viejo con features en niveles
+        # alimentado con las nuevas no falla — reindex() rellena con NaN lo
+        # que no encuentra — sino que devuelve ruido en silencio.
+        'features_version': FEATURES_VERSION,
+        'paso_segundos': PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600),
     }
     if guardar_en_disco:
         os.makedirs(MODEL_DIR, exist_ok=True)
@@ -273,15 +378,23 @@ def entrenar_modelo_global(
     # detectar ítems con error desproporcionado dentro del modelo global.
     # horizonte_horas=1: esto siempre es la métrica de 1 paso (ver
     # calcular_metricas_horizonte más abajo para 2..N pasos).
+    # mae/rmse en gp también en la fila agregada (antes iban en espacio
+    # log-retorno mientras las filas por ítem iban en gp: dos unidades en la
+    # misma columna). El error en espacio log vive ahora en
+    # mae_retorno/rmse_retorno — ver base_de_datos.guardar_metricas_modelo.
     metricas_filas = [
-        (None, train_ts, model_name, float(mae_retorno), float(rmse_retorno), 1, acc_direccional, modo_evaluacion)
+        (None, train_ts, model_name, float(mae_gp), float(rmse_gp), 1, acc_direccional,
+         modo_evaluacion, n_direccional, float(mae_retorno), float(rmse_retorno))
     ]
     for item_id, grupo in test.groupby('item_id', observed=True):
         mae_item = mean_absolute_error(grupo['price_target'], grupo['pred_price'])
         rmse_item = np.sqrt(mean_squared_error(grupo['price_target'], grupo['pred_price']))
-        acc_item = float((np.sign(grupo['pred_target']) == np.sign(grupo['target'])).mean())
+        acc_item, n_item = accuracy_direccional(grupo['target'], grupo['pred_target'])
         metricas_filas.append(
-            (int(item_id), train_ts, model_name, float(mae_item), float(rmse_item), 1, acc_item, modo_evaluacion)
+            (int(item_id), train_ts, model_name, float(mae_item), float(rmse_item), 1, acc_item,
+             modo_evaluacion, n_item,
+             float(mean_absolute_error(grupo['target'], grupo['pred_target'])),
+             float(np.sqrt(mean_squared_error(grupo['target'], grupo['pred_target']))))
         )
     db.guardar_metricas_modelo(metricas_filas)
     logging.info(f"[{model_name}] Métricas guardadas en model_metrics ({len(metricas_filas)} filas)")
@@ -323,7 +436,12 @@ def _evaluar_y_guardar_horizontes(db, bundle, test, model_name, train_ts, modo_e
     muestra = candidatos.sample(n=min(N_MUESTRAS_HORIZONTE, len(candidatos)), random_state=42)
     puntos_eval = list(zip(muestra['item_id'].astype(int), muestra['timestamp_target'].astype(int)))
 
-    resultado = evaluar_horizontes(db, bundle, puntos_eval, n_pasos=N_PASOS_HORIZONTE, tabla='precios_1h')
+    # La tabla sale del bundle, NO fija en 'precios_1h': un modelo entrenado
+    # sobre precios_5m o precios_6h evaluado contra el historial horario
+    # mide otra cosa (los "pasos" del pronóstico recursivo son de otra
+    # duración) y guardaba esa métrica como si fuera del modelo.
+    tabla = bundle.get('tabla', 'precios_1h')
+    resultado = evaluar_horizontes(db, bundle, puntos_eval, n_pasos=N_PASOS_HORIZONTE, tabla=tabla)
     if resultado.empty:
         logging.warning(f"[{model_name}] Sin datos suficientes para evaluar métricas de horizonte.")
         return
@@ -332,8 +450,15 @@ def _evaluar_y_guardar_horizontes(db, bundle, test, model_name, train_ts, modo_e
     for horizonte, grupo in resultado.groupby('horizonte'):
         mae_h = float(grupo['error_abs'].mean())
         rmse_h = float(np.sqrt((grupo['error_abs'] ** 2).mean()))
-        acc_h = float(grupo['acierto_direccional'].mean())
-        filas_horizonte.append((None, train_ts, model_name, mae_h, rmse_h, int(horizonte), acc_h, modo_evaluacion))
+        # Solo los puntos donde el precio efectivamente se movió, igual
+        # criterio que accuracy_direccional() — evaluacion.py ya marca los
+        # empates con acierto_direccional=None para que queden fuera.
+        con_movimiento = grupo[grupo['acierto_direccional'].notna()]
+        acc_h = float(con_movimiento['acierto_direccional'].mean()) if not con_movimiento.empty else None
+        filas_horizonte.append(
+            (None, train_ts, model_name, mae_h, rmse_h, int(horizonte), acc_h,
+             modo_evaluacion, int(len(con_movimiento)), None, None)
+        )
 
     db.guardar_metricas_modelo(filas_horizonte)
     logging.info(
@@ -443,6 +568,7 @@ def entrenar_clasificador_direccional(
     entrenar.
     """
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
+    _avisar_umbral_vs_costo(model_name, umbral_pct)
 
     if item_ids is not None:
         logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
@@ -503,27 +629,41 @@ def entrenar_clasificador_direccional(
     test['prob_sube'] = proba[:, 2]
 
     accuracy_multiclase = float((y_pred_clase == y_test_clase).mean())
-    # Direccional "pura": solo entre los casos donde ni la clase real ni la
-    # predicha fue 'estable' — comparable con la accuracy_direccional del
-    # regresor, que solo mide signo.
-    mascara_no_estable = (y_test_clase != 1) & (y_pred_clase != 1)
-    n_no_estable = int(mascara_no_estable.sum())
-    acc_direccional_pura = (
-        float((y_pred_clase[mascara_no_estable] == y_test_clase[mascara_no_estable]).mean())
-        if n_no_estable > 0 else None
+    # MISMA definición que el regresor (entrenador.accuracy_direccional):
+    # sobre los períodos en que el precio realmente se movió más que el
+    # umbral, ¿acertó la dirección? Antes esta métrica excluía además los
+    # casos en que el modelo predecía 'estable', o sea que abstenerse no
+    # costaba nada — y se guardaba en la misma columna que la del regresor,
+    # calculada sobre otra población. Parte de la "ventaja del clasificador
+    # sobre el regresor" que estaba documentada venía de esa diferencia de
+    # definición, no del modelo.
+    acc_direccional_pura, n_movimientos = accuracy_direccional(
+        test['target'].to_numpy(), _direcciones_desde_clases(y_pred_clase), umbral_pct,
+    )
+
+    # Precisión de la señal accionable: de las veces que dijo 'sube',
+    # ¿cuántas subieron de verdad? Es lo que decide si conviene operarla
+    # (la accuracy global mezcla eso con los aciertos de 'baja', que en este
+    # pipeline no se operan: no se puede vender en corto en el GE).
+    dijo_sube = y_pred_clase == 2
+    precision_sube = (
+        float((y_test_clase[dijo_sube] == 2).mean()) if int(dijo_sube.sum()) > 0 else None
     )
 
     dist = {label: int((y_test_clase == code).sum()) for code, label in CLASE_LABELS.items()}
     logging.info(
         f"[{model_name}] accuracy multi-clase: {accuracy_multiclase:.3f} | "
-        f"accuracy direccional pura (excl. 'estable', n={n_no_estable}): "
+        f"accuracy direccional (movimientos > {umbral_pct}%, n={n_movimientos}): "
         f"{'N/A' if acc_direccional_pura is None else f'{acc_direccional_pura:.3f}'} | "
+        f"precisión de 'sube' (n={int(dijo_sube.sum())}): "
+        f"{'N/A' if precision_sube is None else f'{precision_sube:.3f}'} | "
         f"distribución test: {dist}"
     )
 
     train_ts = int(ahora_ts) if ahora_ts is not None else int(dataset['timestamp_target'].max())
     db.guardar_metricas_modelo([
-        (None, train_ts, model_name, None, None, 1, acc_direccional_pura, modo_evaluacion)
+        (None, train_ts, model_name, None, None, 1, acc_direccional_pura,
+         modo_evaluacion, n_movimientos, None, None)
     ])
     logging.info(f"[{model_name}] Métrica guardada en model_metrics")
 
@@ -545,6 +685,8 @@ def entrenar_clasificador_direccional(
             'ma_windows': [3, 6],
             'umbral_pct': umbral_pct,
             'clase_labels': CLASE_LABELS,
+            'features_version': FEATURES_VERSION,
+            'paso_segundos': PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600),
         }
         os.makedirs(MODEL_DIR, exist_ok=True)
         joblib.dump(bundle, model_path)

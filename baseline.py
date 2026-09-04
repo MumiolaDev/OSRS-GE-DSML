@@ -29,7 +29,7 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from base_de_datos import OSRSBaseDatos
-from entrenador import N_ITEMS_LIQUIDOS, TEST_FRACTION
+from entrenador import N_ITEMS_LIQUIDOS, TEST_FRACTION, accuracy_direccional
 from preprocesamiento import build_training_set
 
 MODEL_NAME_FLAT = "baseline_flat"
@@ -68,31 +68,56 @@ def evaluar_baselines(db, n_items=N_ITEMS_LIQUIDOS, tabla='precios_1h'):
 
     train_ts = int(dataset['timestamp_target'].max())
 
-    # retorno_anterior = log(price_actual) - price_lag_1 (price_lag_1 ya
-    # está en espacio log, ver preprocesamiento.construir_features).
-    log_precio_actual = np.log(test['price_actual'])
-    retorno_anterior = log_precio_actual - test['price_lag_1']
+    # ret_lag_1 ya ES el log-retorno del período anterior
+    # (log(p_t) - log(p_t-1), ver preprocesamiento.construir_features): desde
+    # que las features son relativas no hay que reconstruirlo restando un
+    # nivel absoluto, que es lo que hacía antes con price_lag_1.
+    retorno_anterior = test['ret_lag_1']
+    precio_actual = test['price_actual']
+
+    def _metricas(pred_retorno, nombre):
+        """MAE/RMSE en gp (la unidad de model_metrics.mae) y en espacio
+        log-retorno (mae_retorno/rmse_retorno), más la accuracy direccional
+        con la MISMA definición que entrenador.py — sin esto el baseline no
+        es comparable contra el modelo real, que es su única razón de ser."""
+        pred_precio = precio_actual * np.exp(pred_retorno)
+        acc, n = accuracy_direccional(test['target'], pred_retorno)
+        return {
+            'mae': float(mean_absolute_error(test['price_target'], pred_precio)),
+            'rmse': float(np.sqrt(mean_squared_error(test['price_target'], pred_precio))),
+            'mae_retorno': float(mean_absolute_error(test['target'], pred_retorno)),
+            'rmse_retorno': float(np.sqrt(mean_squared_error(test['target'], pred_retorno))),
+            'accuracy_direccional': acc,
+            'n_evaluado': n,
+            'nombre': nombre,
+        }
 
     resultados = {}
 
     # --- baseline_flat: predicted_target = 0 ---
-    mae_flat = mean_absolute_error(test['target'], np.zeros(len(test)))
-    rmse_flat = np.sqrt(mean_squared_error(test['target'], np.zeros(len(test))))
-    resultados[MODEL_NAME_FLAT] = {'mae': mae_flat, 'rmse': rmse_flat, 'accuracy_direccional': None}
-    logging.info(f"[{MODEL_NAME_FLAT}] MAE retorno (log): {mae_flat:.5f} | RMSE retorno (log): {rmse_flat:.5f}")
+    # Sin signo (predice exactamente cero), así que su accuracy direccional
+    # queda en None a propósito: solo sirve de piso de MAE/RMSE.
+    flat = _metricas(np.zeros(len(test)), MODEL_NAME_FLAT)
+    flat['accuracy_direccional'], flat['n_evaluado'] = None, 0
+    resultados[MODEL_NAME_FLAT] = flat
+    logging.info(
+        f"[{MODEL_NAME_FLAT}] MAE retorno (log): {flat['mae_retorno']:.5f} | MAE: {flat['mae']:.2f} gp"
+    )
 
     # --- baseline_momentum: predicted_target = retorno_anterior ---
-    mae_mom = mean_absolute_error(test['target'], retorno_anterior)
-    rmse_mom = np.sqrt(mean_squared_error(test['target'], retorno_anterior))
-    acc_mom = float((np.sign(retorno_anterior) == np.sign(test['target'])).mean())
-    resultados[MODEL_NAME_MOMENTUM] = {'mae': mae_mom, 'rmse': rmse_mom, 'accuracy_direccional': acc_mom}
+    momentum = _metricas(retorno_anterior, MODEL_NAME_MOMENTUM)
+    resultados[MODEL_NAME_MOMENTUM] = momentum
+    acc_momentum = momentum['accuracy_direccional']
     logging.info(
-        f"[{MODEL_NAME_MOMENTUM}] MAE retorno (log): {mae_mom:.5f} | RMSE retorno (log): {rmse_mom:.5f} | "
-        f"accuracy direccional: {acc_mom:.3f}"
+        f"[{MODEL_NAME_MOMENTUM}] MAE retorno (log): {momentum['mae_retorno']:.5f} | "
+        f"MAE: {momentum['mae']:.2f} gp | accuracy direccional: "
+        f"{'N/A' if acc_momentum is None else f'{acc_momentum:.3f}'} "
+        f"sobre {momentum['n_evaluado']} movimientos"
     )
 
     filas = [
-        (None, train_ts, nombre, float(m['mae']), float(m['rmse']), 1, m['accuracy_direccional'], 'holdout')
+        (None, train_ts, nombre, m['mae'], m['rmse'], 1, m['accuracy_direccional'], 'holdout',
+         m['n_evaluado'], m['mae_retorno'], m['rmse_retorno'])
         for nombre, m in resultados.items()
     ]
     db.guardar_metricas_modelo(filas)

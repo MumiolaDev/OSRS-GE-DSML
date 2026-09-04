@@ -32,12 +32,13 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from preprocesamiento import construir_features, columnas_feature
+from preprocesamiento import (
+    construir_features, columnas_feature, FEATURES_VERSION, PASO_SEGUNDOS_POR_TABLA,
+)
 
-# Segundos por paso, según la tabla de origen — usado tanto por el pronóstico
-# recursivo (pronosticar_item) como por el del clasificador (pronosticar_clase_item)
-# para calcular el timestamp del período que se está prediciendo.
-PASO_SEGUNDOS_POR_TABLA = {'precios_1h': 3600, 'precios_6h': 6 * 3600, 'precios_5m': 300}
+# PASO_SEGUNDOS_POR_TABLA se importa de preprocesamiento.py (donde ahora
+# también lo necesita el reindexado a la grilla regular) en vez de tener la
+# misma tabla de segundos-por-intervalo repetida en dos archivos.
 
 
 def cargar_modelo(model_name=None, model_path=None):
@@ -71,7 +72,32 @@ def cargar_modelo(model_name=None, model_path=None):
         from entrenador import MODEL_NAME_HORARIO, MODEL_PATHS, MODEL_DIR
         nombre = model_name or MODEL_NAME_HORARIO
         model_path = MODEL_PATHS.get(nombre, os.path.join(MODEL_DIR, f"model_{nombre}.pkl"))
-    return joblib.load(model_path)
+    bundle = joblib.load(model_path)
+    _verificar_version_features(bundle, model_path)
+    return bundle
+
+
+def _verificar_version_features(bundle, origen):
+    """
+    Rechaza un bundle entrenado con un esquema de features distinto del que
+    produce preprocesamiento.py hoy (ver FEATURES_VERSION).
+
+    Hace falta un chequeo explícito porque el modo de falla es silencioso:
+    _preparar_fila_prediccion arma la fila con `reindex(columns=
+    bundle['feature_cols'])`, que rellena con NaN toda columna que el
+    bundle esperaba y ya no existe. XGBoost acepta NaN sin protestar
+    (los trata como valores faltantes), así que un modelo viejo sigue
+    "prediciendo" — ruido, sin ningún error ni warning. Mejor romper con un
+    mensaje claro y que el usuario reentrene.
+    """
+    version = bundle.get('features_version', 1)
+    if version != FEATURES_VERSION:
+        raise ValueError(
+            f"El modelo guardado en {origen} se entrenó con features_version={version} y el "
+            f"código actual genera la versión {FEATURES_VERSION}. Reentrenalo "
+            "(\"Entrenar ahora\" en Mis modelos, o esperar al próximo job horario) antes de "
+            "usarlo: predecir con features de otra versión devuelve ruido en silencio."
+        )
 
 
 def _preparar_fila_prediccion(df, bundle, item_id, buy_limit, members):
@@ -84,7 +110,12 @@ def _preparar_fila_prediccion(df, bundle, item_id, buy_limit, members):
     suficiente historia para calcular lags/medias móviles.
     """
     target_col = bundle['target_col']
-    feats = construir_features(df, target_col, bundle['lags'], bundle['ma_windows'])
+    # paso_segundos del bundle: las features se calculan sobre la grilla
+    # temporal regular de la tabla con la que se entrenó (ver
+    # preprocesamiento._reindexar_a_grilla). Con bundles nuevos siempre está;
+    # el default es solo por si falta.
+    paso_segundos = bundle.get('paso_segundos', PASO_SEGUNDOS_POR_TABLA.get(bundle.get('tabla'), 3600))
+    feats = construir_features(df, target_col, bundle['lags'], bundle['ma_windows'], paso_segundos)
     feature_cols_base = columnas_feature(feats, target_col)
     feats = feats.dropna(subset=feature_cols_base)
     if feats.empty:

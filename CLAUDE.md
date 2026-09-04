@@ -34,10 +34,12 @@ python mantenimiento.py           # retención/purga de todas las tablas de seri
 streamlit run dashboard.py        # dashboard de monitoreo, solo lectura
 python -m pytest tests/           # tests unitarios de las funciones puras (sin DB, sin red)
 ```
-No hay linter configurado todavía. Los tests (`tests/`) cubren solo funciones puras (impuesto/
-margen/dimensionamiento de `metricas.py`, `_agrupar_en_rangos` de `recolector.py`,
-`calcular_checkpoints` de `replay_historico.py`, `_clasificar_retorno` de `entrenador.py`) — nada
-que toque la DB o la API real todavía.
+No hay linter configurado todavía. Los tests (`tests/`) cubren funciones puras (impuesto/
+margen/dimensionamiento/ventanas por tiempo de `metricas.py`, `_agrupar_en_rangos` y
+`_ultimo_bucket_cerrado` de `recolector.py`, `calcular_checkpoints` de `replay_historico.py`,
+`_clasificar_retorno` y `accuracy_direccional` de `entrenador.py`, la grilla regular y las
+features relativas de `preprocesamiento.py`) más los que usan una DB SQLite temporal
+(`modelos_config`, helpers de `pagina_modelos.py`) — nada que toque la API real.
 
 ## Arquitectura del pipeline
 
@@ -70,17 +72,36 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
 
 - **`osrs_ge_api.py`**: cliente de la API. Los endpoints `/5m`, `/1h`, `/6h` devuelven un
   snapshot de **todos** los ítems del juego en cada llamada (no aceptan filtrar por item_id);
-  el filtrado a ítems específicos, si se necesita, se hace después sobre el DataFrame.
-  Dos gotchas verificados empíricamente (no documentados por la API): (1) el `timestamp` debe
+  el filtrado a ítems específicos, si se necesita, se hace después sobre el DataFrame. Todas
+  las requests salen por una `requests.Session` compartida con `timeout=30` y reintentos con
+  backoff (`REINTENTOS`) — **nunca** sacar el timeout: sin él, un socket colgado congela el
+  scheduler entero de un proceso 24/7 sin log ni excepción.
+  Tres gotchas verificados empíricamente (no documentados por la API): (1) el `timestamp` debe
   ser un múltiplo exacto del step del intervalo (300/3600/21600) o devuelve `400 Bad Request`
   — cualquier backfill manual tiene que alinear `desde`/`hasta` antes de generar el rango, no
   solo pasar `int(time.time())`; (2) la API no tiene datos reales antes de **2021-03-08**
   (~08:00 UTC) — timestamps anteriores devuelven `200 OK` con `data` vacío, no un error, así
-  que "sin filas" ahí es esperable y no un bug.
+  que "sin filas" ahí es esperable y no un bug; (3) **pedir el endpoint SIN `timestamp` no
+  devuelve el último bucket cerrado sino el anterior a ese** (a las 13:39 UTC, `/1h` sin
+  timestamp devuelve las 11:00, mientras que `/1h?timestamp=12:00` devuelve 3.055 ítems sin
+  problema; el bucket en curso sí vuelve vacío). Por eso la recolección programada pasa
+  siempre un timestamp explícito — ver `recolector._ultimo_bucket_cerrado`.
+  `_procesar_data_historicals` descarta el ítem si le falta cualquiera de las dos puntas de
+  precio en ese bucket, lo que deja huecos reales en la serie de un ítem poco líquido (medido:
+  28% de las horas en Elysian spirit shield, 96% en un 3rd age) — de ahí el reindexado a
+  grilla regular de `preprocesamiento.py`.
 - **`recolector.py`**: loop de `schedule` pensado para correr indefinidamente, con todos los
   horarios alineados al reloj de pared en UTC (`.at(..., "UTC")`), no relativos a cuándo arrancó
-  el proceso — ver `_programar_cada_n_minutos_alineado`. `ITEM_IDS` vacío = sin filtro (uso
-  normal); `collect_5min`/`collect_1h`/`collect_6h` recolectan un snapshot puntual;
+  el proceso — ver `_programar_cada_n_minutos_alineado` (acepta `offset_minutos`, hoy 1: se pide
+  un minuto DESPUÉS del cierre del bucket, no en el instante exacto). `ITEM_IDS` vacío = sin
+  filtro (uso normal). Lo que registra el scheduler es **`collect_programado(db, interval)`**,
+  que pide explícitamente los últimos buckets cerrados que falten
+  (`_ultimo_bucket_cerrado`/`_timestamps_pendientes`, mira 2 para auto-repararse si uno falla o
+  todavía no estaba agregado); `collect_5min`/`collect_1h`/`collect_6h` siguen existiendo para
+  el backfill, donde el timestamp siempre es explícito. Sin esto la recolección en vivo iba
+  ~2 horas atrasada y el "pronóstico de la próxima hora" era en realidad el de una hora que ya
+  había terminado — y el walk-forward, que asume datos hasta el checkpoint, medía un escenario
+  que en vivo nunca se daba;
   `backfill(interval, start_ts, end_ts, db, delay=1.0)` descarga un rango histórico (**siempre
   `delay >= 1.0`**, estimar tamaño y confirmar con el usuario antes de uno grande). Al backfillear
   meses/años de `precios_1h`, el cuello de botella no es la API (~1.6s/request) sino el propio
@@ -97,12 +118,19 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   horizonte para los de tipo='regresor'; `job_semanal` (domingo 04:00 UTC, con catch-up si se
   perdió la ventana — ver
   `verificar_catchup_semanal`) corre la retención. `rellenar_huecos_al_inicio` además dispara
-  `replay_historico.ejecutar_replay()` sobre los huecos detectados en `precios_1h` — pero acota el
-  límite inferior del hueco a `mantenimiento.RETENCION_DIAS[tabla]` (no a `MIN(timestamp)`): sin
-  eso, un dato suelto viejo en la tabla hace que esto intente rellenar/replayear meses de historia
-  que `mantenimiento.py` va a purgar en la próxima corrida semanal de todos modos. Loggea a
-  `logs/` además de consola.
-- **`base_de_datos.py`**: esquema SQLite. Las tablas de series de tiempo (`precios_5m/1h/6h`,
+  `replay_historico.ejecutar_replay_modelo()` sobre los huecos detectados, **para cada modelo
+  activo de `modelos_config` cuya tabla sea la de ese intervalo** — no para `global_horario`/
+  `global_diario`, que es lo que hacía antes vía `ejecutar_replay()` y que dejó de tener sentido
+  cuando `modelos_config` pasó a arrancar vacía (un hueco de una semana disparaba 168 fits de
+  XGBoost sobre 200 ítems para modelos que nadie tiene, mientras los del usuario quedaban sin
+  cubrir). Acota el límite inferior del hueco a `mantenimiento.RETENCION_DIAS[tabla]` (no a
+  `MIN(timestamp)`): sin eso, un dato suelto viejo en la tabla hace que esto intente
+  rellenar/replayear meses de historia que `mantenimiento.py` va a purgar en la próxima corrida
+  semanal de todos modos. Loggea a `logs/` además de consola.
+- **`base_de_datos.py`**: esquema SQLite. `OSRSBaseDatos.conectar()` es el único lugar que abre
+  conexiones (con `busy_timeout` de 15s): el recolector, la app de escritorio y el dashboard
+  escriben/leen sobre la misma DB y con el default de 5s una escritura que cae encima de otra
+  falla en vez de esperar. Las tablas de series de tiempo (`precios_5m/1h/6h`,
   `precios_1h_diario`, `predicciones`) usan `PRIMARY KEY` compuesta + `INSERT OR IGNORE`/
   `OR REPLACE` — idempotentes a propósito, seguir el mismo patrón si se agrega una tabla nueva.
   `resumen_actual` y `model_metrics` guardan el estado del screener y del modelo (se
@@ -126,11 +154,25 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   cree uno. `contar_modelos_config_activos()` topea `MAX_MODELOS_ACTIVOS` (8) contando solo
   `cadencia != 'manual'` — un par regresor+clasificador horario (ver `escritorio/`) consume 2 de
   esos 8 slots.
-- **`preprocesamiento.py`**: features en espacio logarítmico (lags y medias móviles de
-  log-precio/log-volumen, encoding cíclico de hora y día de semana) y target = log-retorno del
-  siguiente período, no precio crudo — necesario para que un modelo global sea comparable entre
-  ítems de escalas de precio muy distintas. `build_training_set(..., hasta_timestamp=...)` arma
-  el dataset multi-ítem, opcionalmente acotado a un momento del pasado.
+- **`preprocesamiento.py`**: features **todas relativas** (retornos acumulados `ret_lag_k`,
+  distancia a la media móvil `dist_ma_price_w`, volatilidad, spread, desbalance de volumen,
+  encoding cíclico de hora y día de semana) y target = log-retorno del siguiente período, no
+  precio crudo. Nada en niveles absolutos, a propósito: el target es una diferencia y un árbol
+  no puede restar dos features, así que con lags en log-precio absoluto (la versión 1 de este
+  archivo) el modelo solo podía memorizar rangos de precio por ítem — y encima `log_price`
+  estaba excluido de las features, o sea que tenía que predecir un movimiento medido desde un
+  punto de referencia que no veía. Medido sobre 24 ítems y 365 horas reales, 3 cortes
+  temporales: 54.9% (IC95% 52.7-57.1) de accuracy direccional con niveles vs **68.8%**
+  (66.7-70.8) con relativas. El MAE no mejora — ninguna de las dos le gana al baseline "el
+  precio no cambia" (`baseline.py`), la ganancia está en la dirección.
+  `_reindexar_a_grilla` deja cada serie sobre la grilla temporal regular antes de calcular
+  nada: sin eso `shift(1)` significa "la fila anterior que exista" (que puede ser de hace diez
+  horas, ver el bullet de `osrs_ge_api.py`) y el target deja de ser el movimiento de UN período.
+  `FEATURES_VERSION` se guarda en el bundle y `prediccion.py` la verifica — un .pkl de otra
+  versión no falla solo, predice ruido en silencio (`reindex(columns=...)` rellena con NaN y
+  XGBoost los acepta). `build_training_set(..., hasta_timestamp=...)` arma el dataset
+  multi-ítem, opcionalmente acotado a un momento del pasado; el `paso_segundos` se deriva de la
+  tabla, nunca se pasa a mano.
 - **`entrenador.py`**: entrena un `XGBRegressor` con split temporal (no aleatorio, para no
   filtrar futuro hacia el pasado) — `modo_evaluacion='holdout'` en vivo, `'walkforward'` en el
   replay (entrena con todo menos el último período y evalúa solo ahí, mucho más barato que
@@ -141,12 +183,26 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   (ver el bullet de `base_de_datos.py` y de `escritorio/`), `MODEL_NAME_HORARIO`/
   `MODEL_NAME_DIARIO`/`MODEL_NAME_CLASIF_F2P_100GP`/etc. son solo nombres de referencia que la
   app/el dashboard usan como default si un modelo con ese nombre exacto llega a existir.
+  **Métricas (`accuracy_direccional`, una sola definición compartida)**: la accuracy
+  direccional se mide SOLO sobre los períodos en que el precio efectivamente se movió más que
+  `UMBRAL_CLASIF_PCT`. Antes el regresor usaba `sign(pred)==sign(real)` sobre todas las filas,
+  y como el retorno real es exactamente 0 entre el 7% y el 35% de las horas según el ítem (los
+  precios son enteros), todos esos empates contaban como error: la misma corrida daba 31.7%
+  con esa fórmula y 55.9% con la actual. El clasificador, en cambio, excluía los casos
+  'estable' reales Y predichos, o sea que abstenerse le salía gratis — dos poblaciones
+  distintas en la misma columna de `model_metrics`. Parte de la ventaja del clasificador sobre
+  el regresor que este archivo documentaba venía de esa diferencia de definición.
+  `model_metrics.mae`/`rmse` son ahora SIEMPRE gp (antes la fila agregada iba en log-retorno y
+  las de detalle por ítem en gp, en la misma columna); el espacio log vive en
+  `mae_retorno`/`rmse_retorno`, y `n_evaluado` dice sobre cuántos movimientos se midió la
+  accuracy (la app lo usa para el intervalo de confianza).
   `entrenar_clasificador_direccional()` (mismo archivo) es un `XGBClassifier` de 3 clases
-  (sube/estable/baja, `UMBRAL_CLASIF_PCT`) en vez de derivar la dirección del signo de la
-  regresión — **da bastante mejor accuracy direccional que el regresor** (validado
-  walk-forward, no solo un split), aunque esa métrica sola no garantiza ganancia real: hace
-  falta el backtest de PnL (`backtest.simular_clasificador_walkforward`) para confirmarlo — ver
-  el bullet de `backtest.py`. Una configuración concreta (`solo_f2p=True, n_items=10,
+  (sube/estable/baja, `UMBRAL_CLASIF_PCT`, subido de 0.5% a 1.0% porque el movimiento horario
+  mediano de los ítems líquidos está entre 0.2% y 0.9%) en vez de derivar la dirección del
+  signo de la regresión. `UMBRAL_COSTO_PCT` (2%, el impuesto GE) es el piso por debajo del cual
+  una señal 'sube' no cubre el costo de operar salvo capturando el spread — `entrenar_...`
+  loguea un warning si el umbral queda por debajo, en vez de dejarlo como default silencioso.
+  Una configuración concreta (`solo_f2p=True, n_items=10,
   precio_minimo=100, excluir_item_ids=[2353, 449, 453]`, Steel bar/Adamantite ore/Coal) quedó
   validada con un test de significancia por permutación sobre 90 días/5.639 trades (gana
   significativamente más que el azar, p=0.002, aunque con la ganancia muy concentrada en un
@@ -171,7 +227,16 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
 - **`metricas.py`**: screener de margen/ROI/volatilidad por ítem, pensado para mostrarse a un
   humano (no para features de modelo — eso es `preprocesamiento.py`). Puebla `resumen_actual`
   (sin filtrar liquidez — eso lo hace `filtrar_screener_liquido()` en el punto de consumo,
-  porque ítems casi sin liquidez generan `roi_pct` absurdos). `dimensionar_oportunidad()` acota
+  porque ítems casi sin liquidez generan `roi_pct` absurdos; ese filtro acepta además
+  `antiguedad_maxima_horas`, que los consumidores en vivo pasan en 6: `resumen_actual` guarda
+  el último dato DISPONIBLE de cada ítem y para uno poco líquido puede ser de hace días,
+  mostrado como si fuera el precio de ahora). `volumen_24h`/`pct_cambio_24h`/`pct_cambio_7d` se
+  calculan sobre horas de RELOJ (`_ventana`), no sobre las últimas N filas — con huecos, 24
+  filas pueden abarcar días y el filtro de liquidez sobrestimaba justo a los ítems más
+  ilíquidos. `calcular_resumen_todos` trae el historial en lotes de `ITEMS_POR_LOTE` ítems con
+  `obtener_precios_multi`, no una conexión SQLite por ítem (eran ~1.600 por corrida de
+  `job_horario` con la DB casi vacía, ~4.600 con la DB llena, y si esto falla `job_horario`
+  aborta el reentrenamiento entero). `dimensionar_oportunidad()` acota
   las unidades simuladas al volumen real esperado, no al `buy_limit` completo.
   `margen_neto_proyectado()` combina la predicción del modelo con el impuesto GE para una señal
   de flip con horizonte.
@@ -180,8 +245,22 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   dashboard). `cargar_modelo(model_name=...)` resuelve la ruta vía `entrenador.MODEL_PATHS`.
 - **`backtest.py`**: simula la estrategia de flip sobre un rango histórico con precios reales
   (compra y venta ya conocidas) — usar_modelo=True/False para comparar "solo screener" vs
-  "screener+modelo". Rápido si el rango ya fue cubierto por `replay_historico.py` (lee la señal
-  directo de `predicciones`); si no, cae a un fallback más lento vía `prediccion.pronosticar_item`.
+  "screener+modelo". Dos supuestos que ahora son explícitos y antes inflaban el resultado:
+  (1) la decisión se toma al CIERRE del período `t` (cuando la API publica sus datos) y la
+  compra ocurre en `t+1`, no a `avg_low_price(t)`, que es el promedio de un período ya
+  terminado — con un movimiento horario mediano de 0.2-0.9%, una barra de ventaja alcanza para
+  inventar toda la rentabilidad; (2) cada trade se valúa en sus **dos cotas**, optimista
+  (comprar en la punta baja y vender en la alta: captura el spread, requiere que las dos
+  órdenes se completen) y pesimista (cruzar el spread en las dos puntas). Medido sobre 365
+  horas reales: la cota optimista cierra en ganancia entre el 15% y el 84% de las veces según
+  el ítem, la pesimista entre el 0% y el 1% — **la diferencia entera es el spread, no el
+  modelo**, y el resultado real de operar está entre las dos. `_resumen` devuelve las dos, y
+  una comparación con/sin modelo solo vale si se sostiene en ambas. También respeta el reset de
+  4h del límite de compra (`HORAS_BUY_LIMIT`); el capital sigue siendo ilimitado, así que
+  `profit_total` es una cota superior. Rápido si el rango ya fue cubierto por
+  `replay_historico.py` (lee la señal directo de `predicciones`); si no, cae a un fallback más
+  lento vía `prediccion.pronosticar_item`. La señal de entrada es siempre la predicción de 1
+  paso para el período de compra, también con horizontes mayores.
   `simular_clasificador()`/`simular_clasificador_walkforward()` son el equivalente para el
   clasificador direccional de `entrenador.py` (compra solo si predice "sube", horizonte fijo
   en 1 paso, sin recursión) — la versión walkforward llama

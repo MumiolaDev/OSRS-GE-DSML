@@ -21,10 +21,18 @@ DB_PATH = "data/osrs_ge.db"
 MAX_ITEMS_POR_MODELO = 50
 MAX_MODELOS_ACTIVOS = 8
 
+# Cuánto espera una escritura a que se libere el lock de la DB antes de
+# tirar "database is locked". El default de sqlite3 son 5 segundos, que se
+# quedan cortos cuando el recolector está insertando un snapshot de miles de
+# filas justo mientras la app de escritorio (o el dashboard, u otro hilo)
+# consulta — con WAL las lecturas no bloquean, pero dos escrituras sí.
+BUSY_TIMEOUT_MS = 15000
+
+
 class OSRSBaseDatos:
 
     def __init__(self, db_path = DB_PATH ):
-        
+
         self.db_path = db_path
 
         # sqlite3.connect no crea directorios padre — en un clon nuevo del
@@ -34,7 +42,7 @@ class OSRSBaseDatos:
         if carpeta:
             os.makedirs(carpeta, exist_ok=True)
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
 
         # WAL permite leer (notebook / futura app) mientras el recolector escribe.
@@ -182,6 +190,24 @@ class OSRSBaseDatos:
         self._migrar_esquema(conn)
         conn.close()
 
+    def conectar(self):
+        """
+        Conexión SQLite con `busy_timeout` configurado (ver BUSY_TIMEOUT_MS).
+        Todo el módulo abre y cierra su conexión por llamada — ese patrón es
+        lo que hace seguro llamar estos métodos desde varios hilos/procesos
+        (el recolector, la app de escritorio y el dashboard conviven sobre la
+        misma DB), pero sin el timeout una escritura que cae justo encima de
+        otra falla de inmediato en vez de esperar su turno.
+
+        Pública a propósito: los módulos que arman sus propias queries con
+        pandas (metricas.py, backtest.py, la app) deberían usar esto en vez
+        de `sqlite3.connect(db.db_path)` directo, para heredar la misma
+        política.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_MS / 1000)
+        conn.execute(f'PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}')
+        return conn
+
     def _migrar_esquema(self, conn):
         """
         Agrega columnas/tablas nuevas a un esquema que ya pudo haber sido
@@ -207,6 +233,24 @@ class OSRSBaseDatos:
             c.execute('ALTER TABLE model_metrics ADD COLUMN accuracy_direccional REAL')
         if 'modo_evaluacion' not in columnas_model_metrics:
             c.execute("ALTER TABLE model_metrics ADD COLUMN modo_evaluacion TEXT DEFAULT 'holdout'")
+        # n_evaluado: sobre cuántas observaciones se calculó
+        # accuracy_direccional. Sin esto, un "57% de acierto" medido sobre 30
+        # movimientos y otro medido sobre 30.000 se muestran igual en la app,
+        # y el primero es indistinguible del azar (ver
+        # escritorio/paginas/pagina_modelos._resumen_calidad, que ahora
+        # calcula el intervalo de confianza con este número).
+        if 'n_evaluado' not in columnas_model_metrics:
+            c.execute('ALTER TABLE model_metrics ADD COLUMN n_evaluado INTEGER')
+        # mae_retorno/rmse_retorno: el error en espacio log-retorno, que es
+        # en el que entrena el modelo. Antes la fila agregada guardaba ESTE
+        # número en la columna `mae` mientras que las filas por ítem
+        # guardaban gp — dos unidades distintas en la misma columna, con las
+        # dos graficadas juntas en el dashboard. Ahora `mae`/`rmse` son
+        # siempre gp (comparables entre sí) y el espacio log vive acá.
+        if 'mae_retorno' not in columnas_model_metrics:
+            c.execute('ALTER TABLE model_metrics ADD COLUMN mae_retorno REAL')
+        if 'rmse_retorno' not in columnas_model_metrics:
+            c.execute('ALTER TABLE model_metrics ADD COLUMN rmse_retorno REAL')
 
         # Único por (item_id o agregado, train_timestamp, model_name,
         # horizonte_horas, modo_evaluacion) — sin esto, correr job_horario/
@@ -440,7 +484,7 @@ class OSRSBaseDatos:
                 "pausá o eliminá alguno antes de activar uno nuevo (o creá este con cadencia 'manual')."
             )
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         ahora = int(time.time())
         c.execute(
@@ -469,7 +513,7 @@ class OSRSBaseDatos:
         recolector.job_horario/job_diario (cadencia='horaria'/'diaria',
         estado='activo') para saber qué reentrenar en cada corrida, y por
         la UI para mostrar el listado completo (sin filtro)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         query = 'SELECT * FROM modelos_config'
         condiciones, params = [], []
@@ -489,7 +533,7 @@ class OSRSBaseDatos:
 
     def obtener_modelo_config(self, model_id):
         """Un modelo de modelos_config como dict, o None si no existe."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute('SELECT * FROM modelos_config WHERE model_id = ?', (model_id,))
         fila = c.fetchone()
@@ -501,7 +545,7 @@ class OSRSBaseDatos:
         diaria) — usado para aplicar el tope de modelos simultáneos antes
         de activar uno nuevo (ver escritorio/paginas/pagina_modelos.py),
         sin contar los de cadencia='manual' (no cargan el scheduler)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute(
             "SELECT COUNT(*) FROM modelos_config WHERE estado = 'activo' AND cadencia != 'manual'"
@@ -548,7 +592,7 @@ class OSRSBaseDatos:
             valores.append(valor)
         valores.append(model_id)
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute(f'UPDATE modelos_config SET {", ".join(sets)} WHERE model_id = ?', valores)
         filas_afectadas = c.rowcount
@@ -567,7 +611,7 @@ class OSRSBaseDatos:
         pagina_modelos.py), no un efecto secundario silencioso de borrar la
         configuración.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute('DELETE FROM modelos_config WHERE model_id = ?', (model_id,))
         filas_afectadas = c.rowcount
@@ -588,7 +632,7 @@ class OSRSBaseDatos:
         domina sobre el costo real del INSERT en SQLite. Mismo resultado
         (INSERT OR IGNORE, una sola transacción), mucho más rápido.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
 
         filas = [
@@ -623,7 +667,7 @@ class OSRSBaseDatos:
         items_mapping: lista de dicts tal como los entrega
         OSRSGeAPI.get_item_mapping() (claves: id, name, members, limit).
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
 
         filas = [
@@ -658,7 +702,7 @@ class OSRSBaseDatos:
         no histórico, así que se limpia y se vuelve a llenar completo en
         cada corrida (no tiene sentido acumular resúmenes viejos acá).
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
 
         calculado_en = int(time.time())
@@ -703,7 +747,7 @@ class OSRSBaseDatos:
         igual vería datos posteriores a X ya backfilleados en la tabla.
         Devuelve DataFrame con columnas: timestamp, avg_high_price, avg_low_price, high_volume, low_volume
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         query = f"SELECT item_id, timestamp, avg_high_price, avg_low_price, high_volume, low_volume FROM {table} WHERE item_id = ? "
 
         params = [item_id]
@@ -734,7 +778,7 @@ class OSRSBaseDatos:
         if not item_ids:
             return pd.DataFrame(columns=['item_id', 'timestamp', 'avg_high_price', 'avg_low_price', 'high_volume', 'low_volume'])
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         placeholders = ','.join('?' * len(item_ids))
         query = (
             f"SELECT item_id, timestamp, avg_high_price, avg_low_price, high_volume, low_volume "
@@ -776,7 +820,7 @@ class OSRSBaseDatos:
             'precios_6h': 'timestamp',
             'precios_1h_diario': 'fecha',
         }
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         resumen = {}
         for tabla, col in columna_tiempo.items():
@@ -818,7 +862,7 @@ class OSRSBaseDatos:
         (2353), que en el backtest walk-forward de 90 días perdió plata
         tanto con la señal del modelo como comprando a ciegas.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         if solo_f2p:
             prefix = 'r.'
@@ -851,7 +895,7 @@ class OSRSBaseDatos:
         cooldown: no reavisar el mismo ítem en cada corrida de job_horario
         si no cambió sustancialmente desde la última vez.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute(
             '''INSERT INTO alertas_enviadas (item_id, ultima_alerta, ultimo_roi_pct, ultimo_margen_neto)
@@ -868,7 +912,7 @@ class OSRSBaseDatos:
     def obtener_ultima_alerta(self, item_id):
         """(ultima_alerta, ultimo_roi_pct, ultimo_margen_neto) o None si
         nunca se alertó este ítem todavía."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute(
             '''SELECT ultima_alerta, ultimo_roi_pct, ultimo_margen_neto
@@ -883,7 +927,7 @@ class OSRSBaseDatos:
         """Registra el timestamp de la última corrida exitosa de `tarea`
         (tabla mantenimiento_estado) — usado por recolector.verificar_catchup_semanal
         para hacer catch-up si job_semanal no corrió en su ventana programada."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute(
             '''INSERT INTO mantenimiento_estado (tarea, ultima_corrida) VALUES (?, ?)
@@ -896,7 +940,7 @@ class OSRSBaseDatos:
     def obtener_ultima_corrida(self, tarea):
         """Timestamp de la última corrida registrada de `tarea`, o None si
         nunca corrió (o corrió antes de que existiera este registro)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute('SELECT ultima_corrida FROM mantenimiento_estado WHERE tarea = ?', (tarea,))
         fila = c.fetchone()
@@ -924,7 +968,7 @@ class OSRSBaseDatos:
 
         excluir_item_ids: ver obtener_top_items_liquidez.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         desde = ahora_ts - ventana_horas * 3600
         prefix = 'p.' if solo_f2p else ''
@@ -961,7 +1005,9 @@ class OSRSBaseDatos:
         """
         Guarda métricas de una corrida de entrenamiento en model_metrics.
         filas: lista de tuplas (item_id, train_timestamp, model_name, mae,
-        rmse, horizonte_horas, accuracy_direccional, modo_evaluacion).
+        rmse, horizonte_horas, accuracy_direccional, modo_evaluacion,
+        n_evaluado, mae_retorno, rmse_retorno).
+
         item_id puede ser None para representar una métrica agregada (todo
         el modelo global), no una fila por ítem. horizonte_horas=1 es la
         métrica clásica de 1 paso (entrenador.py); horizontes mayores vienen
@@ -969,19 +1015,27 @@ class OSRSBaseDatos:
         holdout 80/20 en vivo del walk-forward del replay histórico
         (replay_historico.py) — no deben mezclarse en el mismo gráfico.
 
+        UNIDADES (ver la migración en _migrar_esquema): `mae`/`rmse` son
+        SIEMPRE gp, tanto en la fila agregada como en las de detalle por
+        ítem; `mae_retorno`/`rmse_retorno` son los mismos errores en espacio
+        log-retorno, que es en el que entrena el modelo. `n_evaluado` es
+        sobre cuántas observaciones se calculó accuracy_direccional, para
+        poder distinguir una métrica sólida de uno con tres datos.
+
         INSERT OR REPLACE, apoyado en idx_model_metrics_unico (ver
         _migrar_esquema): reentrenar sobre el mismo período (mismo
         train_timestamp — ej. job_horario corriendo dos veces seguidas sin
         que haya llegado dato nuevo todavía) reemplaza la fila en vez de
         duplicarla.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.executemany(
             '''INSERT OR REPLACE INTO model_metrics
                 (item_id, train_timestamp, model_name, mae, rmse,
-                 horizonte_horas, accuracy_direccional, modo_evaluacion)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', filas
+                 horizonte_horas, accuracy_direccional, modo_evaluacion,
+                 n_evaluado, mae_retorno, rmse_retorno)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', filas
         )
         conn.commit()
         conn.close()
@@ -998,7 +1052,7 @@ class OSRSBaseDatos:
         índice UNIQUE requeriría deduplicar primero), así que el chequeo se
         hace acá, antes de decidir si reentrenar un checkpoint.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.execute(
             '''SELECT 1 FROM model_metrics
@@ -1024,7 +1078,7 @@ class OSRSBaseDatos:
         seguido, porque el replay suele cubrir justo el tramo más reciente,
         que también cae dentro del test set holdout en vivo.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self.conectar()
         c = conn.cursor()
         c.executemany(
             '''INSERT OR REPLACE INTO predicciones

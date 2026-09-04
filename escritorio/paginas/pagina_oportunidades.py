@@ -48,6 +48,11 @@ ORDEN_OPCIONES = [
     ('volumen_24h', 'Volumen 24h'),
 ]
 
+# Un ítem cuyo último dato de precio es más viejo que esto no describe el
+# mercado de ahora: su margen/ROI se calcularon con un precio de hace horas
+# o días. Mismo criterio que alertas.py.
+ANTIGUEDAD_MAXIMA_HORAS = 6
+
 
 def _calcular_senales(db, item_ids_screener):
     """
@@ -161,7 +166,14 @@ class PaginaOportunidades(QWidget):
                 self.modelo_tabla.set_dataframe(resumen)
                 return
 
-            filtrado = filtrar_screener_liquido(resumen, volumen_24h_minimo=self.spin_volumen.value())
+            # antiguedad_maxima_horas: resumen_actual guarda el último dato
+            # DISPONIBLE de cada ítem, que para uno poco líquido puede ser de
+            # hace días — mostrar ese margen como si fuera el de ahora es
+            # engañoso. Ver metricas.filtrar_screener_liquido.
+            filtrado = filtrar_screener_liquido(
+                resumen, volumen_24h_minimo=self.spin_volumen.value(),
+                antiguedad_maxima_horas=ANTIGUEDAD_MAXIMA_HORAS,
+            )
             clave_orden = self.combo_orden.currentData() or 'margen_neto'
             filtrado = filtrado.sort_values(clave_orden, ascending=False).reset_index(drop=True)
 
