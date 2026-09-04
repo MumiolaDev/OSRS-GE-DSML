@@ -205,6 +205,14 @@ def pronosticar_item(db, item_id, bundle=None, n_pasos=6, tabla=None, hasta_time
 
         resultados.append({'paso': paso, 'timestamp': ts_pred, 'predicted_price': precio_pred})
 
+        # El punto de partida puede no ser la última fila de `df`: si esa
+        # fila cae justo después de un hueco, sus lags/medias móviles quedan
+        # en NaN y _preparar_fila_prediccion usa una anterior. Truncar acá
+        # deja la serie terminando en ts_actual, así la fila sintética que
+        # se agrega abajo extiende la serie en vez de pisar una observación
+        # real (que además dispararía timestamps duplicados en la grilla).
+        df = df[df['timestamp'] <= ts_actual]
+
         # Fila sintética para poder calcular lags/medias móviles del paso
         # siguiente reciclando construir_features tal cual. Volumen y
         # spread se mantienen igual al último dato real conocido — no se
