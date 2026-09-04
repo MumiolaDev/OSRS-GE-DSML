@@ -9,7 +9,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from base_de_datos import OSRSBaseDatos
 from metricas import GE_TAX_RATE
-from preprocesamiento import build_training_set, FEATURES_VERSION, PASO_SEGUNDOS_POR_TABLA
+from preprocesamiento import (
+    build_training_set, COLUMNAS_RECONSTRUCCION, FEATURES_VERSION, PASO_SEGUNDOS_POR_TABLA,
+)
 
 MODEL_DIR = "models"
 
@@ -85,7 +87,15 @@ N_MUESTRAS_HORIZONTE = 200
 # Columnas del dataset que no son features (reconstrucción/target), el resto
 # (lags, medias móviles, encoding de tiempo, item_id, buy_limit, members) se
 # usa como entrada del modelo.
-NON_FEATURE_COLS = ['timestamp_target', 'price_actual', 'price_target', 'target']
+NON_FEATURE_COLS = COLUMNAS_RECONSTRUCCION + ['target_margen']
+
+# Cuántos ítems se compran por período con un modelo de tipo 'spread'. La
+# métrica de calidad de ese modelo es "de los TOP_K_SPREAD que eligió cada
+# hora, ¿qué fracción terminó teniendo margen positivo?" — no tiene sentido
+# medirlo sobre todo el universo, porque la decisión real es un ranking: se
+# compran unos pocos, no todos. 5 es el valor con el que se midió la ventaja
+# documentada en preprocesamiento._agregar_target_margen.
+TOP_K_SPREAD = 5
 
 # Dirección asociada a cada clase del clasificador (ver CLASE_LABELS):
 # 'estable' es 0, o sea "no me juego por ninguna dirección".
@@ -162,6 +172,74 @@ def _avisar_umbral_vs_costo(model_name, umbral_pct):
             "solo es rentable si además se captura el spread (cruzarla con margen_neto del "
             "screener antes de operar)."
         )
+
+
+def _resolver_item_ids(db, model_name, item_ids, n_items, solo_f2p, precio_minimo,
+                       excluir_item_ids, ahora_ts):
+    """Universo de ítems del modelo: la lista explícita si el usuario los
+    eligió a mano, o el ranking de liquidez (en vivo o "hasta" un momento del
+    pasado, para el replay). Lista vacía si no hay ninguno."""
+    if item_ids is not None:
+        logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
+        return item_ids
+    if ahora_ts is None:
+        item_ids = db.obtener_top_items_liquidez(
+            n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+    else:
+        item_ids = db.obtener_top_items_liquidez_hasta(
+            ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
+    logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
+    return item_ids
+
+
+def _dividir_temporalmente(dataset, modo_evaluacion):
+    """
+    (train, test, corte) con split TEMPORAL — nunca aleatorio, para no filtrar
+    futuro hacia el pasado. Ver el docstring de entrenar_modelo_global sobre
+    la diferencia entre 'holdout' y 'walkforward'. (None, None, None) si
+    alguno de los dos lados queda vacío.
+    """
+    if modo_evaluacion == 'walkforward':
+        corte = dataset['timestamp_target'].max()
+        train = dataset[dataset['timestamp_target'] < corte]
+        test = dataset[dataset['timestamp_target'] == corte].copy()
+    else:
+        corte = dataset['timestamp_target'].quantile(1 - TEST_FRACTION)
+        train = dataset[dataset['timestamp_target'] <= corte]
+        test = dataset[dataset['timestamp_target'] > corte].copy()
+    if train.empty or test.empty:
+        return None, None, corte
+    return train, test, corte
+
+
+def _armar_bundle(model, dataset, feature_cols, tabla, extra=None):
+    """
+    Bundle que se guarda en disco: no solo el modelo, también los metadatos
+    para reproducir EXACTAMENTE la misma codificación en inferencia. XGBoost,
+    con enable_categorical, codifica item_id/members como los códigos enteros
+    de su dtype 'category' en el momento del fit — si prediccion.py arma esas
+    columnas con categorías distintas (ej. un solo ítem, código 0), los splits
+    categóricos del árbol comparan contra el ítem equivocado sin ningún error
+    visible. Guardar `dataset['item_id'].cat.categories` es lo que lo evita.
+    """
+    bundle = {
+        'model': model,
+        'feature_cols': feature_cols,
+        'item_id_categories': dataset['item_id'].cat.categories,
+        'members_categories': dataset['members'].cat.categories,
+        'target_col': 'avg_low_price',
+        'tabla': tabla,
+        'lags': 5,
+        'ma_windows': [3, 6],
+        # Ver preprocesamiento.FEATURES_VERSION: prediccion.py lo verifica
+        # antes de inferir. Un bundle viejo con features en niveles
+        # alimentado con las nuevas no falla — reindex() rellena con NaN lo
+        # que no encuentra — sino que devuelve ruido en silencio.
+        'features_version': FEATURES_VERSION,
+        'paso_segundos': PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600),
+    }
+    bundle.update(extra or {})
+    return bundle
 
 
 def entrenar_modelo_global(
@@ -265,14 +343,8 @@ def entrenar_modelo_global(
     """
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
 
-    if item_ids is not None:
-        logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
-    else:
-        if ahora_ts is None:
-            item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
-        else:
-            item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
-        logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
+    item_ids = _resolver_item_ids(db, model_name, item_ids, n_items, solo_f2p,
+                                  precio_minimo, excluir_item_ids, ahora_ts)
     if not item_ids:
         logging.error(
             f"[{model_name}] Sin ítems disponibles — correr metricas.py antes de entrenar en "
@@ -291,17 +363,10 @@ def entrenar_modelo_global(
         return False
     logging.info(f"[{model_name}] Dataset combinado: {len(dataset)} filas, {dataset['item_id'].nunique()} ítems con features")
 
-    if modo_evaluacion == 'walkforward':
-        corte = dataset['timestamp_target'].max()
-        train = dataset[dataset['timestamp_target'] < corte]
-        test = dataset[dataset['timestamp_target'] == corte].copy()
-        if train.empty or test.empty:
-            logging.error(f"[{model_name}] Dataset insuficiente para walk-forward (train={len(train)}, test={len(test)}).")
-            return False
-    else:
-        corte = dataset['timestamp_target'].quantile(1 - TEST_FRACTION)
-        train = dataset[dataset['timestamp_target'] <= corte]
-        test = dataset[dataset['timestamp_target'] > corte].copy()
+    train, test, corte = _dividir_temporalmente(dataset, modo_evaluacion)
+    if train is None:
+        logging.error(f"[{model_name}] Dataset insuficiente para el split {modo_evaluacion}.")
+        return False
     logging.info(
         f"[{model_name}] Split temporal ({modo_evaluacion}) en timestamp {int(corte)}: "
         f"train={len(train)} filas, test={len(test)} filas"
@@ -345,30 +410,7 @@ def entrenar_modelo_global(
         f"{'N/A' if acc_direccional is None else f'{acc_direccional:.3f}'} sobre {n_direccional} movimientos"
     )
 
-    # Se guarda un bundle (no solo el modelo): XGBoost, con enable_categorical,
-    # codifica item_id/members como los códigos enteros de su dtype 'category'
-    # en el momento del fit — si prediccion.py arma esas columnas con una
-    # categoría distinta (ej. un solo ítem, código 0) en vez de con exactamente
-    # las mismas categorías vistas al entrenar, los splits categóricos del
-    # árbol comparan contra el ítem equivocado sin ningún error visible.
-    # Guardar `dataset['item_id'].cat.categories` (y lo mismo para members)
-    # es lo que le permite a prediccion.py reproducir esa codificación exacta.
-    bundle = {
-        'model': model,
-        'feature_cols': feature_cols,
-        'item_id_categories': dataset['item_id'].cat.categories,
-        'members_categories': dataset['members'].cat.categories,
-        'target_col': 'avg_low_price',
-        'tabla': tabla,
-        'lags': 5,
-        'ma_windows': [3, 6],
-        # Ver preprocesamiento.FEATURES_VERSION: prediccion.py lo verifica
-        # antes de inferir. Un bundle viejo con features en niveles
-        # alimentado con las nuevas no falla — reindex() rellena con NaN lo
-        # que no encuentra — sino que devuelve ruido en silencio.
-        'features_version': FEATURES_VERSION,
-        'paso_segundos': PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600),
-    }
+    bundle = _armar_bundle(model, dataset, feature_cols, tabla, {'tipo': 'regresor'})
     if guardar_en_disco:
         os.makedirs(MODEL_DIR, exist_ok=True)
         joblib.dump(bundle, model_path)
@@ -578,14 +620,8 @@ def entrenar_clasificador_direccional(
     model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
     _avisar_umbral_vs_costo(model_name, umbral_pct)
 
-    if item_ids is not None:
-        logging.info(f"[{model_name}] Ítems elegidos manualmente: {len(item_ids)}")
-    else:
-        if ahora_ts is None:
-            item_ids = db.obtener_top_items_liquidez(n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
-        else:
-            item_ids = db.obtener_top_items_liquidez_hasta(ahora_ts, n_items, solo_f2p=solo_f2p, precio_minimo=precio_minimo, excluir_item_ids=excluir_item_ids)
-        logging.info(f"[{model_name}] Ítems líquidos seleccionados: {len(item_ids)}")
+    item_ids = _resolver_item_ids(db, model_name, item_ids, n_items, solo_f2p,
+                                  precio_minimo, excluir_item_ids, ahora_ts)
     if not item_ids:
         logging.error(f"[{model_name}] Sin ítems disponibles.")
         return None, None
@@ -600,16 +636,9 @@ def entrenar_clasificador_direccional(
         logging.error(f"[{model_name}] No se pudo construir el dataset de entrenamiento.")
         return None, None
 
-    if modo_evaluacion == 'walkforward':
-        corte = dataset['timestamp_target'].max()
-        train = dataset[dataset['timestamp_target'] < corte]
-        test = dataset[dataset['timestamp_target'] == corte].copy()
-    else:
-        corte = dataset['timestamp_target'].quantile(1 - TEST_FRACTION)
-        train = dataset[dataset['timestamp_target'] <= corte]
-        test = dataset[dataset['timestamp_target'] > corte].copy()
-    if train.empty or test.empty:
-        logging.error(f"[{model_name}] Dataset insuficiente (train={len(train)}, test={len(test)}).")
+    train, test, corte = _dividir_temporalmente(dataset, modo_evaluacion)
+    if train is None:
+        logging.error(f"[{model_name}] Dataset insuficiente para el split {modo_evaluacion}.")
         return None, None
 
     feature_cols = [c for c in dataset.columns if c not in NON_FEATURE_COLS]
@@ -682,25 +711,183 @@ def entrenar_clasificador_direccional(
     # el .pkl productivo desde backtest.py/replay_historico.py, que llaman
     # esta función solo por (modelo, test), potencialmente muchas veces.
     if guardar_en_disco:
-        bundle = {
-            'model': modelo,
-            'feature_cols': feature_cols,
-            'item_id_categories': dataset['item_id'].cat.categories,
-            'members_categories': dataset['members'].cat.categories,
-            'target_col': 'avg_low_price',
-            'tabla': tabla,
-            'lags': 5,
-            'ma_windows': [3, 6],
-            'umbral_pct': umbral_pct,
-            'clase_labels': CLASE_LABELS,
-            'features_version': FEATURES_VERSION,
-            'paso_segundos': PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600),
-        }
+        bundle = _armar_bundle(modelo, dataset, feature_cols, tabla, {
+            'tipo': 'clasificador', 'umbral_pct': umbral_pct, 'clase_labels': CLASE_LABELS,
+        })
         os.makedirs(MODEL_DIR, exist_ok=True)
         joblib.dump(bundle, model_path)
         logging.info(f"[{model_name}] Modelo guardado en {model_path}")
 
     return modelo, test
+
+
+def rentabilidad_top_k(test, columna_pred='pred_margen', columna_real='target_margen', top_k=TOP_K_SPREAD):
+    """
+    Métrica de calidad de un modelo de spread: de los `top_k` ítems con mayor
+    margen PREDICHO en cada período, ¿qué fracción terminó teniendo margen
+    REAL positivo? Devuelve (fraccion, n_selecciones, margen_real_medio).
+
+    Se mide sobre un ranking y no sobre todo el universo porque esa es la
+    decisión real: cada hora se compran unos pocos ítems, no todos. Un MAE
+    bajo sobre el universo entero no dice nada útil si el modelo se equivoca
+    justo en la cola que se opera; al revés, un modelo con MAE mediocre que
+    ordena bien la cola alta es exactamente lo que se necesita.
+
+    Comparable contra el azar igual que la accuracy direccional (por eso se
+    guarda en la misma columna de model_metrics): comprar 5 ítems al azar de
+    un universo líquido dio 43.9% de selecciones con margen positivo en el
+    walk-forward de 720 horas, contra 100% eligiendo por este modelo.
+    """
+    if test.empty:
+        return None, 0, None
+    elegidos = (
+        test.sort_values(columna_pred, ascending=False)
+            .groupby('timestamp_target', observed=True)
+            .head(top_k)
+    )
+    if elegidos.empty:
+        return None, 0, None
+    reales = elegidos[columna_real]
+    return float((reales > 0).mean()), int(len(elegidos)), float(reales.mean())
+
+
+def entrenar_modelo_spread(
+    db,
+    n_items=N_ITEMS_LIQUIDOS,
+    model_name='spread',
+    model_path=None,
+    ahora_ts=None,
+    guardar_en_disco=True,
+    modo_evaluacion='holdout',
+    solo_f2p=False,
+    precio_minimo=None,
+    excluir_item_ids=None,
+    item_ids=None,
+    tabla='precios_1h',
+    ventana_dias=None,
+    top_k=TOP_K_SPREAD,
+):
+    """
+    Entrena un XGBRegressor sobre `target_margen`: el margen neto relativo que
+    deja el flip completo DENTRO del período siguiente — comprar en la punta
+    baja y vender en la alta, ya descontado el impuesto GE (ver
+    preprocesamiento._agregar_target_margen).
+
+    Por qué este target y no el de entrenar_modelo_global: ese predice si el
+    precio va a subir, y esa pregunta no se puede operar. La suba que acierta
+    ya ocurrió cuando llega el primer período en el que se puede comprar, así
+    que se termina pagando exactamente el movimiento que se predijo. Medido
+    walk-forward sobre 720 horas de decisión y 80 ítems: elegir por el modelo
+    de retorno rindió -0.38% por operación (peor que elegir al azar, +0.25%),
+    y elegir por ESTE modelo rindió +4.71%, contra +2.27% del screener puro
+    (ordenar por el margen que ya se ve, sin predecir nada).
+
+    Lo que el modelo aporta, dicho de otra forma: el resultado depende de que
+    las dos órdenes se completen, y de las dos cotas medidas se despeja
+    cuántos fills hacen falta para no perder plata — 60.6% eligiendo con este
+    modelo, 69.4% con el screener puro, 93.6% comprando a ciegas. No predice
+    mejor el futuro: baja el listón de ejecución.
+
+    El resto de los parámetros son los mismos que entrenar_modelo_global
+    (universo de ítems, ventana, tabla, modo de evaluación, replay) — ver su
+    docstring.
+
+    Guarda en model_metrics la fracción del top-`top_k` con margen real
+    positivo (columna accuracy_direccional, comparable contra el azar del
+    mismo modo) y el error de predicción del margen en gp (mae/rmse) y
+    relativo (mae_retorno/rmse_retorno). Persiste en `predicciones` el margen
+    predicho y el real EN GP, no un precio — es lo que le permite a la app
+    graficar predicho vs. real sin una tabla nueva (ver
+    escritorio/paginas/pagina_modelos._predicciones_item).
+
+    Devuelve True si entrenó y guardó, False si se cortó antes por falta de
+    ítems/datos — mismo contrato que entrenar_modelo_global.
+    """
+    model_path = model_path or MODEL_PATHS.get(model_name, os.path.join(MODEL_DIR, f"model_{model_name}.pkl"))
+
+    item_ids = _resolver_item_ids(db, model_name, item_ids, n_items, solo_f2p,
+                                  precio_minimo, excluir_item_ids, ahora_ts)
+    if not item_ids:
+        logging.error(f"[{model_name}] Sin ítems disponibles.")
+        return False
+
+    desde_ts = None
+    if ventana_dias is not None:
+        referencia = ahora_ts if ahora_ts is not None else int(time.time())
+        desde_ts = int(referencia - ventana_dias * 86400)
+
+    dataset = build_training_set(db, item_ids, tabla=tabla, hasta_timestamp=ahora_ts, desde_timestamp=desde_ts)
+    if dataset.empty:
+        logging.error(f"[{model_name}] No se pudo construir el dataset de entrenamiento.")
+        return False
+    dataset = dataset.dropna(subset=['target_margen'])
+    if dataset.empty:
+        logging.error(f"[{model_name}] Sin filas con margen calculable.")
+        return False
+
+    train, test, corte = _dividir_temporalmente(dataset, modo_evaluacion)
+    if train is None:
+        logging.error(f"[{model_name}] Dataset insuficiente para el split {modo_evaluacion}.")
+        return False
+    logging.info(
+        f"[{model_name}] Split temporal ({modo_evaluacion}) en timestamp {int(corte)}: "
+        f"train={len(train)} filas, test={len(test)} filas"
+    )
+
+    feature_cols = [c for c in dataset.columns if c not in NON_FEATURE_COLS]
+    modelo = XGBRegressor(
+        n_estimators=300, learning_rate=0.05, max_depth=6,
+        enable_categorical=True, tree_method='hist',
+        random_state=42, verbosity=0,
+    )
+    modelo.fit(train[feature_cols], train['target_margen'])
+    test['pred_margen'] = modelo.predict(test[feature_cols])
+
+    # El margen en gp por unidad: el relativo multiplicado por el precio al
+    # que se compra (avg_low del período siguiente, ya conocido en el test).
+    test['margen_gp_real'] = test['target_margen'] * test['price_target']
+    test['margen_gp_pred'] = test['pred_margen'] * test['price_target']
+
+    fraccion_rentable, n_selecciones, margen_medio = rentabilidad_top_k(test, top_k=top_k)
+    mae_gp = mean_absolute_error(test['margen_gp_real'], test['margen_gp_pred'])
+    rmse_gp = np.sqrt(mean_squared_error(test['margen_gp_real'], test['margen_gp_pred']))
+    mae_rel = mean_absolute_error(test['target_margen'], test['pred_margen'])
+    rmse_rel = np.sqrt(mean_squared_error(test['target_margen'], test['pred_margen']))
+    # Referencia obligada: qué habría pasado comprando los mismos top_k pero
+    # elegidos al azar. Sin esto no se sabe si el modelo aporta o si es que
+    # cualquier ítem del universo tenía margen igual.
+    azar_rentable = float((test['target_margen'] > 0).mean())
+    logging.info(
+        f"[{model_name}] top-{top_k} con margen positivo: "
+        f"{'N/A' if fraccion_rentable is None else f'{fraccion_rentable:.1%}'} "
+        f"(azar en este universo: {azar_rentable:.1%}) sobre {n_selecciones} selecciones | "
+        f"margen real medio del top-{top_k}: "
+        f"{'N/A' if margen_medio is None else f'{margen_medio:.2%}'} | "
+        f"MAE del margen: {mae_gp:.2f} gp"
+    )
+
+    bundle = _armar_bundle(modelo, dataset, feature_cols, tabla, {'tipo': 'spread', 'top_k': top_k})
+    if guardar_en_disco:
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        joblib.dump(bundle, model_path)
+        logging.info(f"[{model_name}] Modelo guardado en {model_path}")
+
+    train_ts = int(ahora_ts) if ahora_ts is not None else int(dataset['timestamp_target'].max())
+    db.guardar_metricas_modelo([
+        (None, train_ts, model_name, float(mae_gp), float(rmse_gp), 1, fraccion_rentable,
+         modo_evaluacion, n_selecciones, float(mae_rel), float(rmse_rel))
+    ])
+
+    # predicted_price/actual_price guardan acá el MARGEN en gp, no un precio
+    # (ver el docstring). Es la misma tabla y el mismo gráfico de la app.
+    db.guardar_predicciones([
+        (int(item_id), int(ts), float(pred), float(real), float(real - pred), model_name, modo_evaluacion)
+        for item_id, ts, pred, real in zip(
+            test['item_id'], test['timestamp_target'], test['margen_gp_pred'], test['margen_gp_real'],
+        )
+    ])
+    logging.info(f"[{model_name}] Métricas y {len(test)} predicciones guardadas")
+    return True
 
 
 def _kwargs_desde_modelo_config(cfg):
@@ -759,6 +946,13 @@ def entrenar_desde_config(db, cfg, **overrides):
     kwargs.update(overrides)
     if cfg['tipo'] == 'clasificador':
         return entrenar_clasificador_direccional(db, **kwargs)
+    if cfg['tipo'] == 'spread':
+        # calcular_metricas_horizonte no aplica: el pronóstico recursivo a
+        # varios pasos es del regresor de precio, no de un margen de un solo
+        # período. El llamador puede pasarlo igual (recolector.job_diario lo
+        # hace solo para 'regresor'), así que se descarta acá.
+        kwargs.pop('calcular_metricas_horizonte', None)
+        return entrenar_modelo_spread(db, **kwargs)
     return entrenar_modelo_global(db, **kwargs)
 
 

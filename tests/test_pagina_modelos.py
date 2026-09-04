@@ -1,12 +1,12 @@
 """
 Tests de los helpers de escritorio/paginas/pagina_modelos.py que no
 necesitan una QApplication activa (son funciones planas, no métodos de un
-QWidget) — _generar_ids_par, _formatear_fecha, _resumen_calidad. Se
+QWidget) — _generar_id, _formatear_fecha, _resumen_calidad. Se
 importan sin problema aunque PySide6 no tenga una ventana corriendo (ver
 el plan de la fase "app de escritorio v1", workstream 5/7): definir clases
 QWidget no requiere una QApplication, solo instanciarlas.
 
-_generar_ids_par y _resumen_calidad tocan una DB SQLite real (temporal,
+_generar_id y _resumen_calidad tocan una DB SQLite real (temporal,
 ver el fixture `db`) porque dependen de OSRSBaseDatos.obtener_modelo_config
 y de leer model_metrics respectivamente.
 """
@@ -19,7 +19,7 @@ import pytest
 
 from base_de_datos import OSRSBaseDatos
 from escritorio.paginas.pagina_modelos import (
-    _formatear_fecha, _generar_ids_par, _margen_error_95, _resumen_calidad,
+    _formatear_fecha, _generar_id, _margen_error_95, _resumen_calidad,
 )
 
 
@@ -46,47 +46,29 @@ class TestFormatearFecha:
         assert resultado[:4].isdigit()
 
 
-class TestGenerarIdsPar:
+class TestGenerarId:
+    """La app crea UN modelo de tipo 'spread' por alta, no un par
+    regresor+clasificador -- ver el docstring de pagina_modelos."""
+
     def test_slug_basico(self, db):
-        id_regresor, id_clasificador = _generar_ids_par(db, "Mis Runas Favoritas")
-        assert id_regresor == 'custom_mis_runas_favoritas_regresor'
-        assert id_clasificador == 'custom_mis_runas_favoritas_clasificador'
+        assert _generar_id(db, "Mis Runas Favoritas") == 'custom_mis_runas_favoritas'
 
     def test_caracteres_especiales_se_normalizan(self, db):
-        id_regresor, id_clasificador = _generar_ids_par(db, "¡Armas de Élite! (top 10)")
-        assert id_regresor.startswith('custom_')
-        assert ' ' not in id_regresor and ' ' not in id_clasificador
-        assert id_regresor.isascii() and id_clasificador.isascii()
+        model_id = _generar_id(db, "¡Armas de Élite! (top 10)")
+        assert model_id.startswith('custom_')
+        assert ' ' not in model_id
+        assert model_id.isascii()
 
     def test_nombre_sin_caracteres_validos_usa_fallback(self, db):
-        id_regresor, id_clasificador = _generar_ids_par(db, "!!!")
-        assert id_regresor == 'custom_modelo_regresor'
-        assert id_clasificador == 'custom_modelo_clasificador'
+        assert _generar_id(db, "!!!") == 'custom_modelo'
 
-    def test_colision_agrega_sufijo_numerico_compartido(self, db):
-        primero_reg, primero_clas = _generar_ids_par(db, "Prueba")
+    def test_colision_agrega_sufijo_numerico(self, db):
+        primero = _generar_id(db, "Prueba")
         db.crear_modelo_config(
-            model_id=primero_reg, nombre="Prueba", tipo='regresor',
+            model_id=primero, nombre="Prueba", tipo='spread',
             cadencia='manual', modo_seleccion='manual', item_ids=[1],
         )
-        segundo_reg, segundo_clas = _generar_ids_par(db, "Prueba")
-        assert segundo_reg != primero_reg
-        assert segundo_reg == f"custom_prueba_1_regresor"
-        assert segundo_clas == f"custom_prueba_1_clasificador"
-
-    def test_colision_solo_en_clasificador_tambien_hace_avanzar_el_sufijo(self, db):
-        """Si sólo el id de clasificador de un sufijo está ocupado, igual
-        hay que saltar ese sufijo entero -- así el par sigue compartiendo
-        el mismo número (ver el docstring de _generar_ids_par: quedan
-        visiblemente emparejados en la tabla)."""
-        primero_reg, primero_clas = _generar_ids_par(db, "Prueba")
-        db.crear_modelo_config(
-            model_id=primero_clas, nombre="Prueba", tipo='clasificador',
-            cadencia='manual', modo_seleccion='manual', item_ids=[1],
-        )
-        segundo_reg, segundo_clas = _generar_ids_par(db, "Prueba")
-        assert segundo_reg == 'custom_prueba_1_regresor'
-        assert segundo_clas == 'custom_prueba_1_clasificador'
+        assert _generar_id(db, "Prueba") == 'custom_prueba_1'
 
 
 class TestMargenError95:

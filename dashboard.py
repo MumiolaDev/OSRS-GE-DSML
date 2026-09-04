@@ -20,7 +20,7 @@ import streamlit as st
 from base_de_datos import OSRSBaseDatos
 from baseline import MODEL_NAME_FLAT, MODEL_NAME_MOMENTUM
 from metricas import filtrar_screener_liquido
-from prediccion import cargar_modelo, pronosticar_item, pronosticar_clase_item
+from prediccion import cargar_modelo, pronosticar_item, pronosticar_margen_items
 
 DB_PATH = 'data/osrs_ge.db'
 
@@ -56,7 +56,7 @@ def _modelos_del_usuario(tipo=None):
 # Modelos con precio continuo en `predicciones` — únicos válidos para las
 # tabs Predicción vs realidad y Pronóstico a futuro (asumen predicted_price/
 # actual_price en gp, no aplican al clasificador, que predice una clase).
-MODELOS_DISPONIBLES = _modelos_del_usuario('regresor')
+MODELOS_DISPONIBLES = _modelos_del_usuario('regresor') + _modelos_del_usuario('spread')
 # Los de arriba + el clasificador + los baselines de baseline.py: todos
 # comparables en model_metrics (tab Calidad del modelo) porque comparten la
 # métrica de accuracy direccional, aunque el clasificador y los baselines no
@@ -79,8 +79,8 @@ def _modelo_cacheado(model_name):
 st.set_page_config(page_title="OSRS GE — Monitoreo", layout="wide")
 st.title("OSRS GE Predictor — Monitoreo")
 
-tab_screener, tab_modelo, tab_predicciones, tab_pronostico, tab_clasificador = st.tabs(
-    ["Screener", "Calidad del modelo", "Predicción vs realidad", "Pronóstico a futuro", "Señal direccional (F2P)"]
+tab_screener, tab_modelo, tab_predicciones, tab_pronostico, tab_que_comprar = st.tabs(
+    ["Screener", "Calidad del modelo", "Predicción vs realidad", "Pronóstico a futuro", "Qué comprar"]
 )
 
 with tab_screener:
@@ -231,83 +231,67 @@ with tab_pronostico:
             st.line_chart(combinado)
             st.dataframe(pronostico[['paso', 'timestamp', 'predicted_price']], use_container_width=True)
 
-with tab_clasificador:
+with tab_que_comprar:
     st.caption(
-        "Señal del clasificador direccional (entrenador.entrenar_clasificador_direccional): "
-        "para cada ítem del modelo elegido, la clase más probable del próximo período — "
-        "baja/estable/sube — en vez de un precio continuo reconstruido. A diferencia de "
-        "'Predicción vs realidad' y 'Pronóstico a futuro' (modelo continuo, horizonte "
-        "recursivo a varios pasos), acá el horizonte es fijo a 1 paso: la inferencia se "
-        "calcula en vivo acá mismo (no hay tabla de predicciones categóricas en la DB, a "
-        "propósito, para no migrar el esquema) sobre el último dato conocido de cada ítem."
+        "Ranking de QUÉ COMPRAR según un modelo de tipo 'spread' "
+        "(entrenador.entrenar_modelo_spread): para cada ítem del modelo elegido, el margen "
+        "neto que espera que deje comprar en la punta baja y vender en la alta durante la "
+        "próxima hora, ya descontado el impuesto GE. A diferencia del margen de "
+        "resumen_actual (columna margen_neto), que es el que YA se vio y puede haber "
+        "desaparecido, este es el del período en el que efectivamente se puede operar. "
+        "Se calcula en vivo acá mismo sobre el último dato conocido de cada ítem."
     )
-    db_clasif = OSRSBaseDatos(DB_PATH)
-    clasificadores = _modelos_del_usuario('clasificador')
-    bundle_clasif = None
-    if not clasificadores:
+    db_spread = OSRSBaseDatos(DB_PATH)
+    modelos_spread = _modelos_del_usuario('spread')
+    bundle_spread = None
+    if not modelos_spread:
         st.info(
-            "No hay ningún modelo clasificador en modelos_config — creá uno desde \"Mis "
-            "modelos\" en la app de escritorio (cada modelo nuevo crea un par "
-            "regresor+clasificador)."
+            "No hay ningún modelo de spread en modelos_config — creá uno desde \"Mis modelos\" "
+            "en la app de escritorio."
         )
     else:
-        model_sel_clasif = st.selectbox("Modelo", clasificadores, key="model_tab_clasificador")
+        model_sel_spread = st.selectbox("Modelo", modelos_spread, key="model_tab_spread")
         try:
-            bundle_clasif = _modelo_cacheado(model_sel_clasif)
+            bundle_spread = _modelo_cacheado(model_sel_spread)
         except FileNotFoundError:
             st.info(
-                f"'{model_sel_clasif}' todavía no tiene un .pkl entrenado — esperar al próximo "
+                f"'{model_sel_spread}' todavía no tiene un .pkl entrenado — esperar al próximo "
                 "job_horario o usar \"Entrenar ahora\" en la app."
             )
         except ValueError as e:  # features_version desactualizada, ver prediccion.py
             st.warning(str(e))
 
-    if bundle_clasif is not None:
-        cfg_clasif = db_clasif.obtener_modelo_config(model_sel_clasif)
-        if cfg_clasif['modo_seleccion'] == 'manual':
-            item_ids_f2p = cfg_clasif['item_ids'] or []
+    if bundle_spread is not None:
+        cfg_spread = db_spread.obtener_modelo_config(model_sel_spread)
+        if cfg_spread['modo_seleccion'] == 'manual':
+            item_ids_modelo = cfg_spread['item_ids'] or []
         else:
-            item_ids_f2p = db_clasif.obtener_top_items_liquidez(
-                cfg_clasif['n_items'], solo_f2p=cfg_clasif['solo_f2p'],
-                precio_minimo=cfg_clasif['precio_minimo'],
-                excluir_item_ids=cfg_clasif['excluir_item_ids'],
+            item_ids_modelo = db_spread.obtener_top_items_liquidez(
+                cfg_spread['n_items'], solo_f2p=cfg_spread['solo_f2p'],
+                precio_minimo=cfg_spread['precio_minimo'],
+                excluir_item_ids=cfg_spread['excluir_item_ids'],
             )
-        filas = []
-        for iid in item_ids_f2p:
-            resultado = pronosticar_clase_item(db_clasif, iid, bundle=bundle_clasif)
-            if resultado is None:
-                continue
-            filas.append({
-                'item_id': iid,
-                'señal': resultado['label'],
-                'prob_sube': resultado['probabilidades'].get('sube'),
-                'prob_estable': resultado['probabilidades'].get('estable'),
-                'prob_baja': resultado['probabilidades'].get('baja'),
-                'precio_actual': resultado['precio_actual'],
-            })
+        ranking = pronosticar_margen_items(db_spread, item_ids_modelo, bundle_spread)
 
-        if not filas:
-            st.warning("Sin historia suficiente para generar señales todavía (ítems recién agregados o huecos de datos).")
+        if ranking.empty:
+            st.warning("Sin historia suficiente todavía (ítems recién agregados o huecos de datos).")
         else:
-            señales = pd.DataFrame(filas)
-            resumen_f2p = query(
+            contexto = query(
                 "SELECT item_id, name, margen_neto, roi_pct, volumen_24h FROM resumen_actual "
-                "WHERE item_id IN ({})".format(",".join("?" * len(item_ids_f2p))),
-                params=tuple(int(i) for i in item_ids_f2p),
+                "WHERE item_id IN ({})".format(",".join("?" * len(item_ids_modelo))),
+                params=tuple(int(i) for i in item_ids_modelo),
             )
-            señales = señales.merge(resumen_f2p, on='item_id', how='left')
-            columnas_orden = [
-                'name', 'señal', 'prob_sube', 'prob_estable', 'prob_baja',
-                'precio_actual', 'margen_neto', 'roi_pct', 'volumen_24h',
-            ]
+            ranking = ranking.merge(contexto, on='item_id', how='left')
             st.caption(
-                "Ordenado por prob_sube descendente — cruzado con margen_neto/roi_pct de "
-                "resumen_actual (metricas.py) para que la señal sea accionable, no solo "
-                "informativa: 'sube' con margen_neto negativo no es necesariamente una "
-                "oportunidad."
+                "Ordenado por margen predicho — cruzado con margen_neto/roi_pct de "
+                "resumen_actual (metricas.py) para poder comparar lo que el modelo espera "
+                "contra lo que se ve ahora. Todo esto asume que las dos órdenes se completan; "
+                "ver el docstring de backtest.py sobre las dos cotas de ejecución."
             )
             st.dataframe(
-                señales[[c for c in columnas_orden if c in señales.columns]]
-                    .sort_values('prob_sube', ascending=False).reset_index(drop=True),
+                ranking[[c for c in [
+                    'name', 'margen_pred_gp', 'margen_pred_pct', 'precio_referencia',
+                    'margen_neto', 'roi_pct', 'volumen_24h',
+                ] if c in ranking.columns]],
                 use_container_width=True,
             )

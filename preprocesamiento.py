@@ -176,6 +176,14 @@ _COLUMNAS_NO_FEATURE = [
 ]
 
 
+# Columnas que preprocess_item devuelve además de las features: no son
+# entrada del modelo, son el target y lo necesario para reconstruir un precio
+# en gp (y un margen en gp) a partir de una predicción relativa.
+COLUMNAS_RECONSTRUCCION = [
+    'timestamp_target', 'price_actual', 'price_target', 'price_target_high', 'target',
+]
+
+
 def columnas_feature(df, target_col='avg_low_price'):
     """Nombres de columnas de `df` que son features del modelo (excluye
     crudas/intermedias y `target_col`, que puede no estar en la lista fija
@@ -222,6 +230,12 @@ def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6], p
     # predecir / contra lo que se evalúa).
     df['price_actual'] = df[target_col]
     df['price_target'] = df[target_col].shift(-1)
+    # Punta ALTA del período siguiente. No hace falta para el target de
+    # retorno, pero sí para el margen ejecutable (ver COLUMNAS_RECONSTRUCCION
+    # y build_training_set): sin ella no se puede construir "cuánto deja
+    # comprar en la punta baja y vender en la alta del período que viene",
+    # que es la única de las tres preguntas que resultó rentable.
+    df['price_target_high'] = df['avg_high_price'].shift(-1)
     df['timestamp_target'] = df['timestamp'].shift(-1)
 
     # Target: log-retorno del siguiente período.
@@ -229,10 +243,10 @@ def preprocess_item(df, target_col='avg_low_price', lags=5, ma_windows=[3, 6], p
 
     # Eliminar filas con NaN (historia insuficiente para lags/MA, hueco de
     # datos en la ventana, o sin período siguiente para el target)
-    df = df.dropna(subset=feature_cols + ['timestamp_target', 'price_actual', 'price_target', 'target'])
+    df = df.dropna(subset=feature_cols + COLUMNAS_RECONSTRUCCION)
     df = df.reset_index(drop=True)
 
-    return df[feature_cols + ['timestamp_target', 'price_actual', 'price_target', 'target']]
+    return df[feature_cols + COLUMNAS_RECONSTRUCCION]
 
 
 def build_training_set(db, item_ids, tabla='precios_1h', hasta_timestamp=None, desde_timestamp=None, **kwargs):
@@ -296,6 +310,8 @@ def build_training_set(db, item_ids, tabla='precios_1h', hasta_timestamp=None, d
     )
     conn.close()
 
+    dataset = _agregar_target_margen(dataset)
+
     dataset = dataset.merge(items_info, on='item_id', how='left')
     # dtype 'category' para que XGBoost use su soporte nativo de categóricas
     # (enable_categorical=True) en vez de tratar item_id como numérico ordinal.
@@ -303,3 +319,43 @@ def build_training_set(db, item_ids, tabla='precios_1h', hasta_timestamp=None, d
     dataset['members'] = dataset['members'].fillna(0).astype('category')
 
     return dataset.sort_values('timestamp_target').reset_index(drop=True)
+
+
+def _agregar_target_margen(dataset):
+    """
+    Agrega `target_margen`: el margen neto RELATIVO que deja el flip completo
+    dentro del período siguiente — comprar en la punta baja y vender en la
+    alta, descontando el impuesto del Grand Exchange:
+
+        (avg_high(t+1) - avg_low(t+1) - impuesto) / avg_low(t+1)
+
+    Es el target de los modelos de tipo 'spread' (entrenador.py) y la única
+    de las tres formulaciones probadas que resultó rentable. Las otras dos:
+
+    - `target` (log-retorno de avg_low): predecir si el precio sube. Se
+      acierta con altísima precisión y NO sirve para comprar — cuando llega
+      el momento de poder operar, ese movimiento ya ocurrió y lo pagás. En
+      walk-forward sobre 720 horas de decisión rindió -0.38% por operación,
+      peor que elegir al azar (+0.25%).
+    - comprar en t+1 y vender en t+2 ('hold'): +4.30%, apenas por debajo de
+      este, y con el doble de exposición temporal.
+
+    Este target: **+4.71% por operación**, contra +2.27% del screener puro
+    (elegir por el margen que ya se ve, sin predecir nada). Todo eso asumiendo
+    que las dos órdenes se completan — ver backtest.py sobre las dos cotas.
+
+    El impuesto se calcula por fila porque depende del ítem (hay exentos y
+    hay tope, ver metricas.calcular_impuesto_ge); acá ya está el item_id de
+    cada fila, a diferencia de preprocess_item, que trabaja ítem por ítem sin
+    saber cuál es.
+    """
+    from metricas import calcular_impuesto_ge
+
+    venta = dataset['price_target_high'].to_numpy()
+    compra = dataset['price_target'].to_numpy()
+    impuesto = np.array([
+        calcular_impuesto_ge(p, int(i)) for p, i in zip(venta, dataset['item_id'])
+    ], dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dataset['target_margen'] = np.where(compra > 0, (venta - compra - impuesto) / compra, np.nan)
+    return dataset

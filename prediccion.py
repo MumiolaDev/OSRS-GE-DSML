@@ -295,6 +295,77 @@ def pronosticar_clase_item(db, item_id, bundle=None, tabla=None, hasta_timestamp
     }
 
 
+def pronosticar_margen_items(db, item_ids, bundle, tabla=None, hasta_timestamp=None):
+    """
+    Ranking de QUÉ COMPRAR para un modelo de tipo 'spread'
+    (entrenador.entrenar_modelo_spread): para cada ítem, el margen neto que el
+    modelo espera que deje el flip completo del próximo período — comprar en
+    la punta baja y vender en la alta, ya descontado el impuesto GE.
+
+    A diferencia de pronosticar_item (¿cuánto va a valer?) y de
+    pronosticar_clase_item (¿sube o baja?), esto responde directamente la
+    pregunta operativa: de todos estos ítems, ¿cuáles conviene tomar ahora?
+    Ver el docstring de entrenar_modelo_spread sobre por qué las otras dos
+    preguntas no se pueden operar.
+
+    Trae el historial de todos los ítems en UNA sola query
+    (obtener_precios_multi) en vez de una por ítem: esto se llama en cada
+    refresco de la pantalla de Oportunidades sobre decenas de ítems.
+
+    Devuelve un DataFrame ordenado por margen predicho descendente, con
+    columnas item_id, margen_pred_pct, margen_pred_gp, precio_referencia,
+    timestamp_dato y timestamp_prediccion. Vacío si ningún ítem tenía
+    suficiente historia.
+
+    `margen_pred_gp` es una estimación: el margen relativo predicho por el
+    precio de compra, que todavía no se conoce (es el del período que viene),
+    así que se usa el último avg_low conocido como referencia.
+    """
+    if tabla is None:
+        tabla = bundle.get('tabla', 'precios_1h')
+    paso_segundos = PASO_SEGUNDOS_POR_TABLA.get(tabla, 3600)
+
+    item_ids = [int(i) for i in item_ids]
+    precios = db.obtener_precios_multi(item_ids, tabla, hasta_timestamp=hasta_timestamp)
+    if precios.empty:
+        return pd.DataFrame()
+
+    conn = sqlite3.connect(db.db_path)
+    marcadores = ','.join('?' * len(item_ids))
+    info = dict(
+        (fila[0], (fila[1], fila[2])) for fila in conn.execute(
+            f'SELECT item_id, buy_limit, members FROM items WHERE item_id IN ({marcadores})', item_ids)
+    )
+    conn.close()
+
+    modelo = bundle['model']
+    filas = []
+    for item_id, df in precios.groupby('item_id'):
+        if item_id not in info:
+            continue
+        buy_limit, members = info[item_id]
+        preparado = _preparar_fila_prediccion(
+            df.sort_values('timestamp').reset_index(drop=True), bundle, item_id, buy_limit, members,
+        )
+        if preparado is None:
+            continue
+        X, precio_actual, ts_actual = preparado
+        margen_pct = float(modelo.predict(X)[0])
+        filas.append({
+            'item_id': int(item_id),
+            'margen_pred_pct': margen_pct,
+            'margen_pred_gp': margen_pct * precio_actual,
+            'precio_referencia': precio_actual,
+            'timestamp_dato': ts_actual,
+            'timestamp_prediccion': ts_actual + paso_segundos,
+        })
+
+    if not filas:
+        logging.warning("pronosticar_margen_items: ningún ítem con historia suficiente.")
+        return pd.DataFrame()
+    return pd.DataFrame(filas).sort_values('margen_pred_pct', ascending=False).reset_index(drop=True)
+
+
 if __name__ == '__main__':
     from base_de_datos import OSRSBaseDatos
 

@@ -20,8 +20,8 @@ import pandas as pd
 import requests
 
 import configuracion
-from metricas import filtrar_screener_liquido, margen_neto_proyectado
-from prediccion import cargar_modelo, pronosticar_item
+from metricas import filtrar_screener_liquido
+from prediccion import cargar_modelo, pronosticar_margen_items
 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -32,10 +32,10 @@ TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 ANTIGUEDAD_MAXIMA_HORAS = 6
 
 
-def _modelo_regresor_activo(db):
+def _modelo_spread_activo(db):
     """
-    model_id del regresor activo más reciente de modelos_config, o None si el
-    usuario todavía no creó ninguno.
+    model_id del modelo de spread activo más reciente de modelos_config, o
+    None si el usuario todavía no creó ninguno.
 
     Antes esto era la constante MODEL_NAME_HORARIO ('global_horario'), que
     dejó de existir cuando modelos_config pasó a arrancar vacía: el resultado
@@ -43,12 +43,12 @@ def _modelo_regresor_activo(db):
     corrida de job_horario, y las alertas nunca llevaban señal del modelo por
     más modelos que el usuario hubiera creado.
     """
-    regresores = [
-        m for m in db.listar_modelos_config(estado='activo') if m['tipo'] == 'regresor'
+    modelos = [
+        m for m in db.listar_modelos_config(estado='activo') if m['tipo'] == 'spread'
     ]
-    if not regresores:
+    if not modelos:
         return None
-    return max(regresores, key=lambda m: m['creado_en'] or 0)['model_id']
+    return max(modelos, key=lambda m: m['creado_en'] or 0)['model_id']
 
 
 def enviar_mensaje_telegram(texto, token=None, chat_id=None):
@@ -88,13 +88,13 @@ def enviar_mensaje_telegram(texto, token=None, chat_id=None):
 
 
 def _formatear_mensaje(candidatos):
-    """candidatos: lista de dicts con name, margen_neto, roi_pct, buy_limit,
-    margen_proyectado_modelo (puede ser None), horizonte_horas."""
+    """candidatos: lista de dicts con name, margen_neto, roi_pct, buy_limit
+    y margen_predicho (puede ser None si ningún modelo cubre ese ítem)."""
     lineas = [f"🔔 <b>{len(candidatos)} oportunidad(es) de flip</b>"]
     for c in candidatos:
         señal = ""
-        if c.get('margen_proyectado_modelo') is not None:
-            señal = f" | modelo ({c['horizonte_horas']}h): {c['margen_proyectado_modelo']:.0f} gp netos proyectados"
+        if c.get('margen_predicho') is not None:
+            señal = f" | modelo: {c['margen_predicho']:.0f} gp de margen esperado la próxima hora"
         lineas.append(
             f"• <b>{c['name']}</b> — margen neto {c['margen_neto']:.0f} gp, "
             f"ROI {c['roi_pct']:.1f}%, buy limit {c['buy_limit']}{señal}"
@@ -110,17 +110,16 @@ def evaluar_alertas(
     cambio_significativo_pct=20.0,
     top_n=10,
     model_name=None,
-    horizonte_horas=3,
 ):
     """
     Filtra resumen_actual con filtrar_screener_liquido() + roi_pct >=
-    umbral_roi_pct, ordena por margen_neto y toma el top_n. Si hay un
-    modelo disponible, cruza cada candidato con margen_neto_proyectado()
-    (metricas.py) para anotar la señal del modelo en el mensaje — no filtra
-    por ella, solo informa; el filtro principal sigue siendo el screener.
-    Usar el modelo como filtro duro queda como mejora futura, una vez
-    calibrada su accuracy_direccional por horizonte (ver evaluacion.py) —
-    hoy no hay garantía de que sea mejor que el azar a todos los horizontes.
+    umbral_roi_pct, ordena por margen_neto y toma el top_n. Si hay un modelo
+    de spread activo, anota además el margen que ese modelo espera para la
+    PRÓXIMA hora (prediccion.pronosticar_margen_items) — el del screener es
+    el que ya se vio y puede haber desaparecido. No filtra por él, solo
+    informa; usarlo como filtro duro queda pendiente de validar cuánto de la
+    ventaja medida sobrevive a la probabilidad real de que las órdenes se
+    completen (ver el docstring de entrenador.entrenar_modelo_spread).
 
     Por ítem, alerta solo si nunca se avisó, si pasó cooldown_horas desde la
     última alerta, o si roi_pct/margen_neto cambió más de
@@ -129,7 +128,7 @@ def evaluar_alertas(
     todos los candidatos que pasan el filtro en UN solo mensaje Telegram,
     no uno por ítem.
     """
-    model_name = model_name or _modelo_regresor_activo(db)
+    model_name = model_name or _modelo_spread_activo(db)
 
     conn = db.conectar()
     resumen = pd.read_sql_query(
@@ -154,8 +153,8 @@ def evaluar_alertas(
     bundle = None
     if model_name is None:
         logging.info(
-            "alertas.py: no hay ningún modelo regresor activo en modelos_config — se alerta solo "
-            "con el screener, sin señal de modelo."
+            "alertas.py: no hay ningún modelo de spread activo en modelos_config — se alerta solo "
+            "con el screener, sin margen predicho."
         )
     else:
         try:
@@ -166,6 +165,18 @@ def evaluar_alertas(
             )
         except Exception as e:
             logging.warning(f"alertas.py: no se pudo cargar el modelo '{model_name}', se omite la señal del modelo: {e}")
+
+    # Margen predicho de todos los candidatos en una sola pasada (una query
+    # de precios para todos, ver pronosticar_margen_items) en vez de un
+    # pronóstico por ítem dentro del loop.
+    margenes_predichos = {}
+    if bundle is not None:
+        try:
+            pronostico = pronosticar_margen_items(db, candidatos_df['item_id'].tolist(), bundle)
+            if not pronostico.empty:
+                margenes_predichos = dict(zip(pronostico['item_id'], pronostico['margen_pred_gp']))
+        except Exception as e:
+            logging.warning(f"alertas.py: no se pudo calcular el margen predicho, se omite: {e}")
 
     ahora = int(time.time())
     candidatos_a_enviar = []
@@ -183,20 +194,7 @@ def evaluar_alertas(
             if not pasado_cooldown and not cambio_roi and not cambio_margen:
                 continue
 
-        margen_proyectado_modelo = None
-        if bundle is not None:
-            try:
-                # Sin `tabla=`: la granularidad sale del bundle (con cuál se
-                # entrenó ese modelo), forzar 'precios_1h' acá le daba
-                # features de otra escala temporal a un modelo de 5m/6h.
-                pronostico = pronosticar_item(db, item_id, bundle, n_pasos=horizonte_horas)
-                if not pronostico.empty:
-                    pred_price = pronostico.iloc[-1]['predicted_price']
-                    margen_proyectado_modelo = margen_neto_proyectado(
-                        fila['avg_low_price'], fila['avg_high_price'], pred_price, item_id,
-                    )
-            except Exception as e:
-                logging.warning(f"alertas.py: error pronosticando ítem {item_id}, se omite la señal del modelo: {e}")
+        margen_predicho = margenes_predichos.get(item_id)
 
         candidatos_a_enviar.append({
             'item_id': item_id,
@@ -204,8 +202,7 @@ def evaluar_alertas(
             'margen_neto': fila['margen_neto'],
             'roi_pct': fila['roi_pct'],
             'buy_limit': int(fila['buy_limit']) if pd.notna(fila['buy_limit']) else None,
-            'margen_proyectado_modelo': margen_proyectado_modelo,
-            'horizonte_horas': horizonte_horas,
+            'margen_predicho': margen_predicho,
         })
 
     if not candidatos_a_enviar:

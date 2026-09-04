@@ -14,26 +14,31 @@ modelo se resume en una frase corta (_resumen_calidad), y los parámetros
 técnicos (lags, medias móviles, umbral del clasificador) no se exponen en
 el formulario de alta, quedan en los defaults sensatos de entrenador.py.
 
-Revertido a un flujo único y más simple (pedido explícito del usuario):
-"+ Nuevo modelo" crea SIEMPRE un par (un regresor + un clasificador) sobre
-los mismos ítems, cadencia horaria, tabla precios_1h. Antes existía
-también "+ Nuevo grupo" (regresor+clasificador × 3 granularidades, 6
-modelos) y un selector de tipo/cadencia en el alta simple; se sacaron de
-la UI. Lo único configurable ahora es la ventana de historial y los
-ítems — el resto queda fijo en `_crear_par_modelos`, no porque
-base_de_datos.crear_modelo_config/entrenador.py hayan perdido esa
-flexibilidad (siguen aceptando tipo/cadencia/tabla arbitrarios, nada de
-eso se tocó), sino porque esta pantalla ya no la expone.
+"+ Nuevo modelo" crea UN modelo de tipo 'spread'
+(entrenador.entrenar_modelo_spread) sobre los ítems elegidos, cadencia
+horaria, tabla precios_1h. Antes creaba un par regresor+clasificador; se
+reemplazó porque ninguno de los dos servía para decidir una compra:
+medido walk-forward sobre 720 horas de decisión, elegir por el regresor de
+precio rendía -0.38% por operación (peor que elegir al azar, +0.25%) y este
+modelo rinde +4.71%. La explicación está en el docstring de
+entrenar_modelo_spread: predecir si el precio sube es una pregunta que no se
+puede operar, porque la suba ya ocurrió cuando llega el momento de comprar.
 
-Al seleccionar un modelo de tipo='regresor' en la tabla (pedido explícito
-del usuario: "un gráfico del regresor sobre lo real"), se muestra un
-gráfico de predicted_price vs. actual_price (tabla `predicciones`) para un
-ítem elegido del propio modelo — prioriza modo_evaluacion='walkforward'
-sobre 'holdout' (mismo criterio que _resumen_calidad: hay datos apenas
-termina el walk-forward inicial, sin esperar a un reentrenamiento en vivo).
-El clasificador no tiene un gráfico equivalente (no persiste
-predicted_price continuo, ver el bullet de entrenador.py en CLAUDE.md) —
-se muestra un mensaje en vez de un gráfico vacío.
+Lo único configurable es la ventana de historial y los ítems — el resto
+queda fijo en `_crear_modelo`, no porque base_de_datos.crear_modelo_config/
+entrenador.py hayan perdido esa flexibilidad (siguen aceptando
+tipo/cadencia/tabla arbitrarios, y los modelos 'regresor'/'clasificador'
+siguen existiendo como comparación en backtest.py/baseline.py), sino porque
+esta pantalla ya no la expone.
+
+Al seleccionar un modelo en la tabla se muestra un gráfico de predicho vs.
+real (tabla `predicciones`) para un ítem elegido del propio modelo — para un
+modelo de spread esas dos columnas son el MARGEN en gp, no un precio (ver
+entrenar_modelo_spread). Prioriza modo_evaluacion='walkforward' sobre
+'holdout' (mismo criterio que _resumen_calidad: hay datos apenas termina el
+walk-forward inicial, sin esperar a un reentrenamiento en vivo). Un modelo
+'clasificador' (solo los creados antes de este cambio) no tiene gráfico
+equivalente: no persiste una serie continua.
 """
 import math
 import re
@@ -61,6 +66,11 @@ from escritorio.widgets.tabla_dataframe import crear_tabla
 TABLA_FIJA = 'precios_1h'
 CADENCIA_FIJA = 'horaria'
 VENTANA_DIAS_DEFAULT = 90.0
+# Un solo tipo de modelo: el que predice el margen neto ejecutable del
+# próximo período (entrenador.entrenar_modelo_spread). Reemplazó al par
+# regresor+clasificador que creaba esta pantalla -- ver el docstring del
+# módulo y el de entrenar_modelo_spread para la medición que lo justifica.
+TIPO_FIJO = 'spread'
 
 # No hay ningún modelo protegido/no-eliminable (pedido explícito del
 # usuario: "no quiero que haya ningún modelo por default. todos tienen que
@@ -72,7 +82,7 @@ VENTANA_DIAS_DEFAULT = 90.0
 # Sin columnas de 'tipo'/'cadencia' (pedido explícito del usuario: no
 # aportan nada ahora que son valores fijos para todo lo creado desde acá
 # -- cadencia siempre 'horaria', y tipo ya se distingue en el propio
-# nombre, "... (regresor)"/"... (clasificador)", ver _crear_par_modelos).
+# nombre del modelo, ver _crear_modelo).
 COLUMNAS_TABLA = [
     ('nombre', 'Nombre'),
     ('estado', 'Estado'),
@@ -96,15 +106,20 @@ def _margen_error_95(acc, n):
     return 1.96 * math.sqrt(max(acc * (1 - acc), 0) / n)
 
 
-def _resumen_calidad(db, model_id):
+def _resumen_calidad(db, model_id, tipo=None):
     """
     Frase corta sobre qué tan bien viene funcionando el modelo, en vez de
-    una tabla de métricas crudas. Se basa en accuracy_direccional de
-    model_metrics (item_id IS NULL, horizonte_horas=1) -- comparable entre
-    regresor y clasificador porque entrenador.accuracy_direccional() es
-    ahora la MISMA función para los dos (antes cada uno usaba su propia
-    definición sobre poblaciones distintas y se guardaban en la misma
-    columna).
+    una tabla de métricas crudas. Se basa en la columna
+    accuracy_direccional de model_metrics (item_id IS NULL,
+    horizonte_horas=1), que guarda una proporción comparable contra el azar
+    en los tres tipos de modelo, aunque midan cosas distintas:
+
+    - 'spread' (el que crea esta pantalla): de los ítems que el modelo eligió
+      cada período, qué fracción terminó con margen neto positivo (ver
+      entrenador.rentabilidad_top_k).
+    - 'regresor'/'clasificador' (modelos viejos): de los períodos en que el
+      precio se movió y el modelo se jugó, qué fracción acertó la dirección
+      (ver entrenador.accuracy_direccional).
 
     Prioriza el PROMEDIO de todas las corridas walkforward sobre la última
     holdout: el walk-forward inicial (replay_historico.ejecutar_replay_modelo,
@@ -115,11 +130,14 @@ def _resumen_calidad(db, model_id):
     único que exista todavía (holdout solo se genera al usar "Entrenar
     ahora" o en una corrida programada).
 
-    El veredicto se compara contra el AZAR (50%) usando el intervalo de
-    confianza, no contra umbrales fijos: si el intervalo incluye el 50%, la
-    respuesta honesta es "todavía no se puede afirmar nada", por más que el
-    número puntual sea 57%.
+    El veredicto se compara contra el 50% usando el intervalo de confianza,
+    no contra umbrales fijos: si el intervalo lo incluye, la respuesta honesta
+    es "todavía no se puede afirmar nada", por más que el número puntual sea
+    57%. Para 'spread' el 50% es una referencia conservadora, no el azar
+    exacto (comprar al azar en un universo líquido dio ~44% de selecciones
+    con margen positivo, ver el log de entrenar_modelo_spread).
     """
+    unidad = "selecciones con margen positivo" if tipo == 'spread' else "movimientos jugados"
     conn = sqlite3.connect(db.db_path)
     c = conn.cursor()
     c.execute(
@@ -133,7 +151,7 @@ def _resumen_calidad(db, model_id):
 
     if acc is not None:
         conn.close()
-        etiqueta = f" — walk-forward, {n_corridas} checkpoints, {n_evaluado or 0} movimientos jugados"
+        etiqueta = f" — walk-forward, {n_corridas} checkpoints, {n_evaluado or 0} {unidad}"
     else:
         c.execute(
             '''SELECT accuracy_direccional, COALESCE(n_evaluado, 0) FROM model_metrics
@@ -147,7 +165,7 @@ def _resumen_calidad(db, model_id):
         if fila is None:
             return "Sin entrenar todavía"
         acc, n_evaluado = fila
-        etiqueta = "" if acc is None else f" — holdout, {n_evaluado} movimientos jugados"
+        etiqueta = "" if acc is None else f" — holdout, {n_evaluado} {unidad}"
 
     if acc is None:
         return "Entrenado (sin métrica de dirección)"
@@ -171,20 +189,15 @@ def _formatear_fecha(ts):
     return "Nunca" if ts is None else datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
 
 
-def _generar_ids_par(db, nombre):
+def _generar_id(db, nombre):
     """
-    Slugs 'model_id_regresor'/'model_id_clasificador' a partir del nombre
-    elegido por el usuario, con un sufijo numérico compartido si ya
-    existe alguno de los dos -- model_id es el mismo string que
-    entrenador.py usa como model_name/model_version en todo el resto del
-    pipeline (ver base_de_datos.crear_modelo_config), así que tiene que
-    ser único. Prefijo 'custom_' para no chocar con los nombres de
-    referencia de entrenador.py (MODEL_PATHS: global_horario, global_diario,
-    las variantes del clasificador F2P), que tienen ruta de .pkl fija.
-    Devuelve
-    (id_regresor, id_clasificador), siempre con el mismo sufijo -- así
-    quedan visiblemente emparejados en la tabla ("mi_modelo_regresor" /
-    "mi_modelo_clasificador"), no con sufijos independientes por tipo.
+    Slug único a partir del nombre elegido por el usuario, con sufijo
+    numérico si ya existe -- model_id es el mismo string que entrenador.py
+    usa como model_name/model_version en todo el resto del pipeline (ver
+    base_de_datos.crear_modelo_config), así que tiene que ser único. Prefijo
+    'custom_' para no chocar con los nombres de referencia de entrenador.py
+    (MODEL_PATHS: global_horario, global_diario, las variantes del
+    clasificador F2P), que tienen ruta de .pkl fija.
     """
     base = 'custom_' + re.sub(r'[^a-z0-9]+', '_', nombre.strip().lower()).strip('_')
     if base == 'custom_':
@@ -192,9 +205,8 @@ def _generar_ids_par(db, nombre):
     sufijo = 0
     while True:
         candidato = base if sufijo == 0 else f"{base}_{sufijo}"
-        id_regresor, id_clasificador = f"{candidato}_regresor", f"{candidato}_clasificador"
-        if db.obtener_modelo_config(id_regresor) is None and db.obtener_modelo_config(id_clasificador) is None:
-            return id_regresor, id_clasificador
+        if db.obtener_modelo_config(candidato) is None:
+            return candidato
         sufijo += 1
 
 
@@ -296,36 +308,24 @@ class _DialogoVentanaWalkforward(QDialog):
         return self.campo_dias.value()
 
 
-def _crear_par_modelos(db, nombre, item_ids, ventana_dias):
+def _crear_modelo(db, nombre, item_ids, ventana_dias):
     """
-    Crea el par regresor+clasificador de un modelo (ver
-    _DialogoNuevoModelo) -- tipo/cadencia/tabla fijos (ver el docstring
-    del módulo), item_ids/ventana_dias los que eligió el usuario. No
-    aborta ante el primer error (ej. el segundo choca con algo
-    inesperado): intenta los dos y junta lo que falló, para que el
-    llamador pueda avisar exactamente cuál se creó.
+    Crea UN modelo de tipo 'spread' (ver el docstring del módulo sobre por
+    qué reemplazó al par regresor+clasificador) -- tipo/cadencia/tabla
+    fijos, item_ids/ventana_dias los que eligió el usuario.
 
-    Devuelve (creados, errores): `creados` es la lista de model_id dados
-    de alta; `errores` es una lista de (model_id, excepción) para los que
-    no se pudieron crear.
+    Devuelve (model_id, None) si se creó, o (None, excepción) si no.
     """
-    id_regresor, id_clasificador = _generar_ids_par(db, nombre)
-    creados = []
-    errores = []
-    for model_id, tipo, etiqueta_tipo in (
-        (id_regresor, 'regresor', 'regresor'),
-        (id_clasificador, 'clasificador', 'clasificador'),
-    ):
-        try:
-            db.crear_modelo_config(
-                model_id=model_id, nombre=f"{nombre} ({etiqueta_tipo})",
-                tipo=tipo, cadencia=CADENCIA_FIJA, modo_seleccion='manual',
-                item_ids=item_ids, tabla=TABLA_FIJA, ventana_dias=ventana_dias,
-            )
-            creados.append(model_id)
-        except (ValueError, sqlite3.IntegrityError) as e:
-            errores.append((model_id, e))
-    return creados, errores
+    model_id = _generar_id(db, nombre)
+    try:
+        db.crear_modelo_config(
+            model_id=model_id, nombre=nombre, tipo=TIPO_FIJO,
+            cadencia=CADENCIA_FIJA, modo_seleccion='manual',
+            item_ids=item_ids, tabla=TABLA_FIJA, ventana_dias=ventana_dias,
+        )
+        return model_id, None
+    except (ValueError, sqlite3.IntegrityError) as e:
+        return None, e
 
 
 def _nombres_items(db, item_ids):
@@ -411,7 +411,7 @@ class PaginaModelos(QWidget):
         # Gráfico de predicted_price vs. actual_price del regresor
         # seleccionado (pedido explícito del usuario) -- ver el docstring
         # del módulo y _actualizar_grafico.
-        grupo_grafico = QGroupBox("Predicción vs. precio real (regresor)")
+        grupo_grafico = QGroupBox("Predicción vs. realidad")
         layout_grafico = QVBoxLayout(grupo_grafico)
         self.combo_item_grafico = QComboBox()
         self.combo_item_grafico.setVisible(False)
@@ -422,7 +422,6 @@ class PaginaModelos(QWidget):
         layout_grafico.addWidget(self.label_grafico_vacio)
         self.grafico = pg.PlotWidget(axisItems={'bottom': pg.DateAxisItem()})
         self.grafico.setBackground('w')
-        self.grafico.setLabel('left', 'Precio (gp)')
         self.grafico.showGrid(x=True, y=True, alpha=0.3)
         self._leyenda_grafico = self.grafico.addLegend()
         self.grafico.setMinimumHeight(200)
@@ -447,7 +446,7 @@ class PaginaModelos(QWidget):
                 {
                     'nombre': cfg['nombre'],
                     'estado': 'Activo' if cfg['estado'] == 'activo' else 'Pausado',
-                    'calidad': _resumen_calidad(self.db, cfg['model_id']),
+                    'calidad': _resumen_calidad(self.db, cfg['model_id'], cfg['tipo']),
                     'ultimo_entrenamiento': _formatear_fecha(cfg['ultimo_entrenamiento_ts']),
                 }
                 for cfg in self._modelos
@@ -485,14 +484,18 @@ class PaginaModelos(QWidget):
         if cfg is None:
             self._model_id_grafico = None
             self.label_grafico_vacio.setText("Seleccioná un modelo de la tabla para ver su gráfico.")
-        elif cfg['tipo'] != 'regresor':
+        elif cfg['tipo'] == 'clasificador':
             self._model_id_grafico = None
             self.label_grafico_vacio.setText(
-                "El clasificador no tiene un gráfico continuo (no predice un precio, sino "
-                "sube/estable/baja) — elegí el regresor del par, mismo nombre con "
-                "\"(regresor)\", para ver esto."
+                "Un clasificador no tiene un gráfico continuo: predice una clase "
+                "(sube/estable/baja), no un valor. Los modelos nuevos son de tipo 'spread' y sí "
+                "lo tienen."
             )
         else:
+            # El eje depende del tipo: un modelo de spread guarda el MARGEN en
+            # gp en las mismas columnas donde el regresor guarda el precio.
+            self.grafico.setLabel(
+                'left', 'Margen neto (gp)' if cfg['tipo'] == 'spread' else 'Precio (gp)')
             self._model_id_grafico = cfg['model_id']
             item_ids = cfg['item_ids'] or []
             nombres = _nombres_items(self.db, item_ids)
@@ -539,25 +542,18 @@ class PaginaModelos(QWidget):
         if dialogo.exec() != QDialog.Accepted:
             return
         valores = dialogo.valores()
-        creados, errores = _crear_par_modelos(
+        model_id, error = _crear_modelo(
             self.db, valores['nombre'], valores['item_ids'], valores['ventana_dias'],
         )
 
         self._refrescar()
-        if creados:
-            self.label_estado.setText(
-                f"Modelo '{valores['nombre']}' creado: {len(creados)} de 2 "
-                f"({'; '.join(creados)}) — arrancando walk-forward inicial de cada uno..."
-            )
-            self._encolar_walkforward(creados)
-        if errores:
-            detalle = "\n".join(f"- {model_id}: {e}" for model_id, e in errores)
-            QMessageBox.warning(
-                self, "Algo no se pudo crear",
-                f"{len(errores)} de 2 fallaron:\n{detalle}",
-            )
-        if not creados and not errores:
-            self.label_estado.setText("No se creó ningún modelo.")
+        if error is not None:
+            QMessageBox.warning(self, "No se pudo crear el modelo", str(error))
+            return
+        self.label_estado.setText(
+            f"Modelo '{valores['nombre']}' creado — arrancando walk-forward inicial..."
+        )
+        self._encolar_walkforward([model_id])
 
     def _entrenar_seleccionado(self):
         cfg = self._fila_seleccionada()

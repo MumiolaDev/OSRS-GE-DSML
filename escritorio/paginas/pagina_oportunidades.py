@@ -5,14 +5,17 @@ eran dos pestañas separadas (Screener + Señal direccional F2P) en una
 sola tabla curada — ver la corrección del usuario sobre simplificar la
 app en vez de portar el dashboard tal cual.
 
-Columnas curadas de resumen_actual (metricas.py) + una columna de señal
-direccional (sube/estable/baja) para los ítems cubiertos por algún modelo
-clasificador ACTIVO del usuario (base_de_datos.modelos_config) — ya no
-solo la variante F2P fija de antes, ahora puede ser cualquier clasificador
-que el usuario haya definido desde "Mis modelos". Si un ítem está cubierto
-por más de un clasificador activo, se muestra la señal del más reciente
-(creado_en más alto) — mantiene la tabla a una sola columna de señal en
-vez de una por modelo, a propósito.
+Columnas curadas de resumen_actual (metricas.py) + el MARGEN PREDICHO para
+la próxima hora, calculado en vivo con los modelos de tipo 'spread' activos
+del usuario (base_de_datos.modelos_config). Esa es la columna por la que la
+tabla ordena por default, y es la que responde "qué comprar": el margen de
+resumen_actual es el que ya se vio y puede haber desaparecido, mientras que
+este es el que el modelo espera que exista cuando efectivamente se pueda
+operar. Los ítems que ningún modelo cubre quedan al final con un guión.
+
+Antes esta columna era una señal direccional (sube/estable/baja) de un
+clasificador; se reemplazó junto con el tipo de modelo — ver el docstring de
+entrenador.entrenar_modelo_spread para la medición que lo justifica.
 """
 import logging
 import sqlite3
@@ -23,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from metricas import filtrar_screener_liquido
-from prediccion import cargar_modelo, pronosticar_clase_item
+from prediccion import cargar_modelo, pronosticar_margen_items
 from escritorio.widgets.tabla_dataframe import crear_tabla
 
 COLUMNAS = [
@@ -32,7 +35,7 @@ COLUMNAS = [
     ('roi_pct', 'ROI'),
     ('buy_limit', 'Límite de compra'),
     ('volumen_24h', 'Volumen 24h'),
-    ('señal', 'Señal'),
+    ('margen_predicho', 'Margen predicho (próx. hora)'),
 ]
 
 FORMATOS = {
@@ -40,9 +43,11 @@ FORMATOS = {
     'roi_pct': lambda v: f"{float(v):.1f}%",
     'buy_limit': lambda v: f"{int(v):,}".replace(',', '.'),
     'volumen_24h': lambda v: f"{int(v):,}".replace(',', '.'),
+    'margen_predicho': lambda v: '—' if v != v else f"{v:,.0f} gp".replace(',', '.'),
 }
 
 ORDEN_OPCIONES = [
+    ('margen_predicho', 'Margen predicho (recomendado)'),
     ('margen_neto', 'Margen neto'),
     ('roi_pct', 'ROI'),
     ('volumen_24h', 'Volumen 24h'),
@@ -54,24 +59,29 @@ ORDEN_OPCIONES = [
 ANTIGUEDAD_MAXIMA_HORAS = 6
 
 
-def _calcular_senales(db, item_ids_screener):
+def _calcular_margenes_predichos(db, item_ids_screener):
     """
-    Para cada modelo activo de tipo='clasificador' en modelos_config,
-    resuelve su universo real de ítems (cfg['item_ids'] directo si
+    Para cada modelo activo de tipo='spread' en modelos_config, resuelve su
+    universo real de ítems (cfg['item_ids'] directo si
     modo_seleccion='manual', o db.obtener_top_items_liquidez con sus
-    parámetros si 'liquidez') y calcula la señal en vivo
-    (prediccion.pronosticar_clase_item) SOLO para los ítems que además
-    están en `item_ids_screener` (los que se van a mostrar) — evita correr
+    parámetros si 'liquidez') y calcula, en vivo, el margen neto que espera
+    del próximo período (prediccion.pronosticar_margen_items) SOLO para los
+    ítems que además están en `item_ids_screener` — no tiene sentido correr
     inferencia sobre ítems que ni van a aparecer en la tabla.
 
-    Devuelve {item_id: 'sube'|'estable'|'baja'}. Si un ítem está cubierto
-    por más de un clasificador activo, gana el más reciente (se procesan
-    del más viejo al más nuevo, y el último en escribir pisa).
+    Esto es lo que responde "qué comprar": a diferencia del margen de
+    `resumen_actual`, que es el que YA se vio (y para cuando se muestra puede
+    haber desaparecido), esta columna es el que el modelo espera que exista
+    en la próxima hora, que es cuando efectivamente se puede operar.
+
+    Devuelve {item_id: margen_predicho_gp}. Si un ítem está cubierto por más
+    de un modelo activo, gana el más reciente (se procesan del más viejo al
+    más nuevo, y el último en escribir pisa).
     """
     item_ids_screener = set(item_ids_screener)
-    señales = {}
+    margenes = {}
 
-    modelos = [m for m in db.listar_modelos_config(estado='activo') if m['tipo'] == 'clasificador']
+    modelos = [m for m in db.listar_modelos_config(estado='activo') if m['tipo'] == 'spread']
     modelos.sort(key=lambda m: m['creado_en'] or 0)
 
     for cfg in modelos:
@@ -94,12 +104,11 @@ def _calcular_senales(db, item_ids_screener):
             logging.warning(f"pagina_oportunidades: no se pudo cargar el modelo '{cfg['model_id']}': {e}")
             continue
 
-        for item_id in candidatos:
-            resultado = pronosticar_clase_item(db, item_id, bundle=bundle)
-            if resultado is not None:
-                señales[item_id] = resultado['label']
+        pronostico = pronosticar_margen_items(db, candidatos, bundle)
+        for _, fila in pronostico.iterrows():
+            margenes[int(fila['item_id'])] = float(fila['margen_pred_gp'])
 
-    return señales
+    return margenes
 
 
 class PaginaOportunidades(QWidget):
@@ -174,14 +183,24 @@ class PaginaOportunidades(QWidget):
                 resumen, volumen_24h_minimo=self.spin_volumen.value(),
                 antiguedad_maxima_horas=ANTIGUEDAD_MAXIMA_HORAS,
             )
-            clave_orden = self.combo_orden.currentData() or 'margen_neto'
-            filtrado = filtrado.sort_values(clave_orden, ascending=False).reset_index(drop=True)
+            clave_orden = self.combo_orden.currentData() or 'margen_predicho'
 
-            señales = _calcular_senales(self.db, filtrado['item_id'].tolist())
+            margenes = _calcular_margenes_predichos(self.db, filtrado['item_id'].tolist())
             filtrado = filtrado.copy()
-            filtrado['señal'] = filtrado['item_id'].map(señales).fillna('—')
+            filtrado['margen_predicho'] = filtrado['item_id'].map(margenes)
 
-            self.label_contador.setText(f"{len(filtrado)} de {len(resumen)} ítems pasan el filtro de liquidez.")
+            # El orden se aplica DESPUÉS de calcular el margen predicho: es
+            # la columna por la que se ordena por default, y no existe hasta
+            # acá. na_position='last' deja abajo los ítems que ningún modelo
+            # cubre, en vez de arriba (NaN ordena primero con ascending=False).
+            filtrado = filtrado.sort_values(
+                clave_orden, ascending=False, na_position='last').reset_index(drop=True)
+
+            cubiertos = int(filtrado['margen_predicho'].notna().sum())
+            self.label_contador.setText(
+                f"{len(filtrado)} de {len(resumen)} ítems pasan el filtro de liquidez; "
+                f"{cubiertos} con margen predicho por algún modelo."
+            )
             self.modelo_tabla.set_dataframe(filtrado)
         except Exception as e:
             self.label_contador.setText(f"No se pudo actualizar el screener: {e}")

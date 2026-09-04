@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 OSRS GE Predictor de Precios: pipeline que recolecta precios de compra/venta del Grand Exchange
 de Old School RuneScape desde la API pública `prices.runescape.wiki`, los almacena en SQLite,
-calcula un screener de oportunidades de flip y entrena modelos XGBoost (regresor de precio +
-clasificador direccional) que el usuario define él mismo, con los ítems y la ventana de
-historial que elija — no hay ningún modelo sembrado por default (pedido explícito del usuario:
+calcula un screener de oportunidades de flip y entrena modelos XGBoost que predicen el MARGEN
+NETO EJECUTABLE del próximo período (tipo 'spread'), que el usuario define él mismo, con los
+ítems y la ventana de historial que elija — no hay ningún modelo sembrado por default (pedido explícito del usuario:
 "no quiero que haya ningún modelo por default, todos tienen que poder eliminarse"), `modelos_config`
 arranca vacía y el pipeline funciona igual de bien sin ningún modelo creado todavía (el screener
 no depende de ninguno). Corre pensado para 24/7 (ver `docs/despliegue_24_7.md`), manda alertas de
@@ -48,9 +48,9 @@ osrs_ge_api.py → recolector.py → base_de_datos.py (SQLite)
                      │  (schedule alineado al reloj: 5m/1h/6h + job_horario + job_diario + job_semanal)
                      ├─→ metricas.py ────────────→ resumen_actual (screener)
                      ├─→ preprocesamiento.py → entrenador.py → model_metrics / predicciones
-                     │         │                    (regresor + clasificador, uno por cada modelo
-                     │         │                     que el usuario haya creado en modelos_config —
-                     │         │                     ninguno por default, ver escritorio/)
+                     │         │                    (uno por cada modelo que el usuario haya creado
+                     │         │                     en modelos_config — ninguno por default, ver
+                     │         │                     escritorio/; hoy siempre de tipo 'spread')
                      │         └─→ evaluacion.py (accuracy direccional + MAE por horizonte)
                      ├─→ replay_historico.py (walk-forward al rellenar huecos del pasado o al crear un modelo)
                      ├─→ alertas.py (Telegram, al final de job_horario)
@@ -60,14 +60,16 @@ prediccion.py (pronóstico recursivo) y backtest.py (simulación histórica) reu
 guardado y las predicciones walk-forward — no están en el loop del recolector.
 
 baseline.py (reglas triviales) es un experimento de comparación fuera del loop del recolector.
-entrenador.entrenar_clasificador_direccional() se reentrena desde job_horario/job_diario para
-CUALQUIER modelo de tipo='clasificador' que el usuario haya creado con esa cadencia — sin
-distinción de código entre regresor y clasificador ni entre "modelos del sistema" y "modelos del
-usuario" (no existen los primeros) — ver el bullet de entrenador.py.
+entrenador.entrenar_desde_config() ramifica por modelos_config.tipo ('spread' | 'regresor' |
+'clasificador') y job_horario/job_diario reentrenan CUALQUIER modelo con esa cadencia, sin
+distinción de código entre tipos ni entre "modelos del sistema" y "modelos del usuario" (no
+existen los primeros) — ver el bullet de entrenador.py.
 
 dashboard.py (Streamlit) lee resumen_actual / model_metrics / predicciones — solo lectura.
 escritorio/ (PySide6/Qt) es la app de escritorio para el usuario final — lee y ESCRIBE
 modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además de leer el resto.
+La pantalla de Oportunidades muestra el margen predicho para la próxima hora
+(prediccion.pronosticar_margen_items) y ordena por ahí: es la respuesta a "qué comprar".
 ```
 
 - **`osrs_ge_api.py`**: cliente de la API. Los endpoints `/5m`, `/1h`, `/6h` devuelven un
@@ -154,7 +156,12 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   cree uno. `contar_modelos_config_activos()` topea `MAX_MODELOS_ACTIVOS` (8) contando solo
   `cadencia != 'manual'` — un par regresor+clasificador horario (ver `escritorio/`) consume 2 de
   esos 8 slots.
-- **`preprocesamiento.py`**: features **todas relativas** (retornos acumulados `ret_lag_k`,
+- **`preprocesamiento.py`**: dos targets y features **todas relativas**. `target` es el
+  log-retorno del siguiente período (lo que predice el regresor de precio) y `target_margen` es
+  el margen neto ejecutable del período siguiente (`_agregar_target_margen`, lo que predice el
+  modelo de tipo 'spread' — ver el bullet de `entrenador.py` para la medición que lo justifica).
+  `preprocess_item` devuelve además `price_target_high` (la punta alta del período siguiente),
+  sin la cual el margen no se puede construir. Features: (retornos acumulados `ret_lag_k`,
   distancia a la media móvil `dist_ma_price_w`, volatilidad, spread, desbalance de volumen,
   encoding cíclico de hora y día de semana) y target = log-retorno del siguiente período, no
   precio crudo. Nada en niveles absolutos, a propósito: el target es una diferencia y un árbol
@@ -173,8 +180,29 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   XGBoost los acepta). `build_training_set(..., hasta_timestamp=...)` arma el dataset
   multi-ítem, opcionalmente acotado a un momento del pasado; el `paso_segundos` se deriva de la
   tabla, nunca se pasa a mano.
-- **`entrenador.py`**: entrena un `XGBRegressor` con split temporal (no aleatorio, para no
-  filtrar futuro hacia el pasado) — `modo_evaluacion='holdout'` en vivo, `'walkforward'` en el
+- **`entrenador.py`**: tres tipos de modelo, todos `XGB*` con split temporal (no aleatorio, para
+  no filtrar futuro hacia el pasado) y `entrenar_desde_config()` como único punto de entrada
+  desde el resto del pipeline. **`entrenar_modelo_spread()` es el que usa la app** y el único
+  que resultó rentable: predice `target_margen`, el margen neto RELATIVO que deja el flip
+  completo dentro del período siguiente (comprar en la punta baja, vender en la alta, menos
+  impuesto GE — ver `preprocesamiento._agregar_target_margen`). Su métrica de calidad es
+  `rentabilidad_top_k()`: de los `TOP_K_SPREAD` ítems que eligió cada período, qué fracción
+  terminó con margen positivo — se mide sobre el ranking y no sobre el universo porque la
+  decisión real es comprar unos pocos, no todos. Guarda en `predicciones` el margen en gp
+  (predicho y real) en las columnas donde el regresor guarda un precio, para reusar el mismo
+  gráfico de la app sin una tabla nueva.
+  Los otros dos (`entrenar_modelo_global`, regresor de precio, y
+  `entrenar_clasificador_direccional`) siguen existiendo como comparación (`baseline.py`,
+  `backtest.py`) pero **la app ya no los crea**: medido walk-forward sobre 720 horas de decisión
+  y 80 ítems, elegir qué comprar con el regresor de precio rendía **-0.38%** por operación —
+  peor que elegir al azar (+0.25%) — contra **+4.71%** del modelo de spread y +2.27% del
+  screener puro (ordenar por el margen que ya se ve). El motivo es estructural y está en el
+  docstring de `entrenar_modelo_spread`: predecir si el precio sube es una pregunta que no se
+  puede operar, porque cuando llega el primer período en el que se puede comprar, esa suba ya
+  ocurrió y se paga. Traducido a lo único que importa, cuántas veces tienen que completarse las
+  dos órdenes para no perder plata: 60.6% con el modelo de spread, 69.4% con el screener puro,
+  93.6% comprando a ciegas. El modelo no predice mejor el futuro: baja el listón de ejecución.
+  El regresor de precio, además, usa `modo_evaluacion='holdout'` en vivo y `'walkforward'` en el
   replay (entrena con todo menos el último período y evalúa solo ahí, mucho más barato que
   repetir un split 80/20 en cada checkpoint histórico). `ahora_ts` simula un momento del pasado;
   `guardar_en_disco=False` evita pisar el `.pkl` durante el replay. Guarda el modelo en `models/`
@@ -298,21 +326,27 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   `prediccion.pronosticar_clase_item()` y cruzado con `margen_neto`/`roi_pct` de `resumen_actual`
   para que sea accionable, default `f2p10_100gp_clasif` (mismo caso: solo si existe). Nunca
   escribe en la DB.
-- **`escritorio/`**: app de escritorio en PySide6/Qt para el usuario final — 4 tabs
+- **`escritorio/`**: app de escritorio en PySide6/Qt para el usuario final. "+ Nuevo modelo"
+  crea UN modelo de tipo 'spread' (antes creaba un par regresor+clasificador; ver el bullet de
+  `entrenador.py`), y "Oportunidades" muestra el **margen predicho para la próxima hora** como
+  columna principal y ordena por ella — esa columna es la respuesta a "qué comprar", y a
+  diferencia del `margen_neto` del screener (que es el que YA se vio y puede haber
+  desaparecido) es el del período en el que efectivamente se puede operar. 4 tabs
   deliberadamente pocas (Inicio, Oportunidades, Mis modelos, Configuración), a diferencia del
   dashboard de Streamlit que tiene mucha más carga de información pensada para el desarrollador.
   `escritorio/main.py` es el punto de entrada (`python -m escritorio.main`).
   `escritorio/paginas/pagina_inicio.py` controla el hilo del recolector (arrancar/parar) y
   muestra progreso real del relleno de huecos/replay. `pagina_oportunidades.py` fusiona
-  screener + señal direccional de cualquier clasificador activo en una sola tabla (no una
-  variante F2P fija). `pagina_modelos.py` es la única pantalla que ESCRIBE en `modelos_config`:
-  "+ Nuevo modelo" crea siempre un par regresor+clasificador (cadencia horaria, tabla
+  screener + margen predicho de cualquier modelo de spread activo en una sola tabla.
+  `pagina_modelos.py` es la única pantalla que ESCRIBE en `modelos_config`:
+  "+ Nuevo modelo" crea un modelo de tipo 'spread' (cadencia horaria, tabla
   precios_1h) sobre los ítems que el usuario elija, con la ventana de historial como único otro
   parámetro configurable — no hay ningún modelo protegido contra borrado, todos son del usuario
   (ver el bullet de `base_de_datos.py`: `modelos_config` arranca vacía). Al seleccionar un
-  regresor en la tabla, muestra un gráfico (`pyqtgraph`) de predicted_price vs. actual_price
-  (tabla `predicciones`) para un ítem elegido del propio modelo — el clasificador no tiene
-  equivalente (no persiste un precio continuo) y muestra un mensaje en vez de un gráfico vacío.
+  modelo en la tabla, muestra un gráfico (`pyqtgraph`) de predicho vs. real (tabla
+  `predicciones`) para un ítem elegido del propio modelo — para un modelo de spread esas dos
+  columnas son el MARGEN en gp, no un precio. Un clasificador (solo los creados antes del
+  cambio) no tiene equivalente y muestra un mensaje en vez de un gráfico vacío.
   El walk-forward corre una vez al crear el modelo (todo el historial disponible en ese
   momento); "Rehacer walk-forward" (cualquier tipo, regresor o clasificador) pide una ventana en
   días y vuelve a correr `ejecutar_replay_modelo` acotado a eso — pensado para cubrir historial

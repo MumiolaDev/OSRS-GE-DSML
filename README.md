@@ -2,8 +2,9 @@
 
 Pipeline en Python que recolecta precios de compra/venta del **Grand Exchange** de Old School
 RuneScape desde la API pública de la OSRS Wiki, los almacena en SQLite, calcula un screener de
-oportunidades de flip y entrena modelos de ML (XGBoost) que predicen hacia dónde va el precio
-de cada ítem — con el objetivo de ayudar a decidir cuándo comprar y cuándo vender. Corre
+oportunidades de flip y entrena modelos de ML (XGBoost) que predicen el margen neto que va a
+dejar cada ítem en la próxima hora — con el objetivo de ayudar a decidir qué comprar, cuándo
+comprar y cuándo vender. Corre
 pensado para 24/7, manda alertas de oportunidades por Telegram y expone un dashboard de
 monitoreo en Streamlit; la futura app web para el usuario final todavía no existe.
 
@@ -19,19 +20,20 @@ monitoreo en Streamlit; la futura app web para el usuario final todavía no exis
 - **Calcula un screener** de oportunidades de flip: margen y ROI (con el impuesto real del
   Grand Exchange aplicado), potencial de ganancia por ciclo de compra, % de cambio, volatilidad,
   percentil dentro del historial reciente y tendencia de volumen.
-- **Entrena los modelos que el usuario define** (no hay ninguno por default): un regresor
-  (XGBoost) que predice el log-retorno del siguiente período y un clasificador direccional de
-  3 clases (baja/estable/sube), sobre los ítems y la ventana de historial que elija. Ambos se
-  validan con un **replay walk-forward** sobre el historial y un **backtest** que simula la
-  estrategia de flip con precios reales, comparado contra reglas triviales de referencia
-  (baseline) y contra comprar a ciegas. El backtest informa siempre **dos cotas de ejecución**
-  — capturando el spread y cruzándolo — porque la diferencia entre ambas es mucho más grande
-  que cualquier ventaja del modelo, y la verdad está en el medio.
+- **Entrena los modelos que el usuario define** (no hay ninguno por default), sobre los ítems y
+  la ventana de historial que elija. El modelo predice el **margen neto ejecutable de la próxima
+  hora**: cuánto deja comprar en la punta baja y vender en la alta, ya descontado el impuesto del
+  Grand Exchange. Eso responde directamente *qué comprar* — la app ordena las oportunidades por
+  esa columna. Se valida con un **replay walk-forward** sobre el historial y un **backtest** que
+  simula la estrategia con precios reales, comparado contra reglas triviales de referencia
+  (baseline), contra el screener sin modelo y contra comprar a ciegas. El backtest informa
+  siempre **dos cotas de ejecución** — capturando el spread y cruzándolo — porque la diferencia
+  entre ambas es mucho más grande que cualquier ventaja del modelo, y la verdad está en el medio.
 - **Manda alertas** de las mejores oportunidades del screener por Telegram, con cooldown por
   ítem para no espamear.
 - **Expone un dashboard** de monitoreo en Streamlit (solo lectura): screener filtrable,
-  calidad del modelo en el tiempo, predicción vs. realidad, pronóstico a futuro y la señal del
-  clasificador direccional.
+  calidad del modelo en el tiempo, predicción vs. realidad, pronóstico a futuro y el ranking de
+  qué comprar.
 - **Tests unitarios** (pytest) de las funciones puras del pipeline (impuesto/margen, ventanas
   por tiempo, agrupamiento de huecos, checkpoints del replay, umbral del clasificador,
   accuracy direccional, grilla temporal y features relativas).
@@ -40,8 +42,12 @@ monitoreo en Streamlit; la futura app web para el usuario final todavía no exis
 
 - **Aplicación web** para el usuario final — hoy solo existe el dashboard interno de
   monitoreo, de solo lectura.
-- El clasificador direccional todavía no alimenta `alertas.py` (solo el dashboard); las
-  alertas hoy se basan en el screener + la señal informativa del regresor.
+- **Modelar la probabilidad de que las órdenes se completen.** Toda la ventaja medida del
+  modelo asume que la compra en la punta baja y la venta en la alta se llenan; si hay que cruzar
+  el spread, ninguna estrategia gana. Hoy el backtest acota ese riesgo con dos cotas, pero falta
+  estimar el número real con datos de 5 minutos.
+- El margen predicho anota las alertas de Telegram pero todavía no las filtra: el filtro
+  principal sigue siendo el screener.
 
 ## Estructura del proyecto
 
@@ -52,7 +58,7 @@ monitoreo en Streamlit; la futura app web para el usuario final todavía no exis
 | `base_de_datos.py` | Esquema y acceso a la base SQLite |
 | `metricas.py` | Screener de mercado (margen, ROI, volatilidad, etc.) |
 | `preprocesamiento.py` | Feature engineering para los modelos de ML |
-| `entrenador.py` | Entrena el regresor y el clasificador direccional |
+| `entrenador.py` | Entrena los modelos (margen ejecutable, y regresor/clasificador de comparación) |
 | `baseline.py` | Reglas triviales de referencia, para comparar contra el modelo real |
 | `evaluacion.py` | Evaluación del modelo a horizontes de varios pasos |
 | `replay_historico.py` | Reentrenamiento walk-forward sobre un rango del pasado |
