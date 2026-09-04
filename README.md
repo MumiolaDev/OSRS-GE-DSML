@@ -1,113 +1,102 @@
 # OSRS GE — Predictor de Precios
 
-Pipeline en Python que recolecta precios de compra/venta del **Grand Exchange** de Old School
-RuneScape desde la API pública de la OSRS Wiki, los almacena en SQLite, calcula un screener de
-oportunidades de flip y entrena modelos de ML (XGBoost) que predicen el margen neto que va a
-dejar cada ítem en la próxima hora — con el objetivo de ayudar a decidir qué comprar, cuándo
-comprar y cuándo vender. Corre pensado para 24/7 (servicio de systemd en Linux), manda alertas
-de oportunidades por Telegram, y tiene una app de escritorio en PySide6/Qt para el usuario
-final más un dashboard de monitoreo en Streamlit para el desarrollador.
+Programa que ayuda a decidir **qué comprar y cuándo** en el Grand Exchange de Old School
+RuneScape.
 
-## Qué hace hoy
+## Qué hace, en simple
 
-- **Recolecta** precios de todo el catálogo de ítems del juego (compra/venta instantánea y
-  volumen) en 5m/1h/6h desde la API pública de la OSRS Wiki, alineado al reloj de pared. Al
-  arrancar, rellena solo los huecos que hayan quedado de cortes anteriores — no hace falta
-  correr nada a mano después de un corte.
-- **Almacena** el histórico en SQLite (modo WAL, lecturas concurrentes con la recolección),
-  con retención/purga/downsampling automáticos por tabla y liberación de espacio en disco
-  (`incremental_vacuum`) para que no crezca sin límite.
-- **Calcula un screener** de oportunidades de flip: margen y ROI (con el impuesto real del
-  Grand Exchange aplicado), potencial de ganancia por ciclo de compra, % de cambio, volatilidad,
-  percentil dentro del historial reciente y tendencia de volumen.
-- **Entrena los modelos que el usuario define** (no hay ninguno por default), sobre los ítems y
-  la ventana de historial que elija. El modelo predice el **margen neto ejecutable de la próxima
-  hora**: cuánto deja comprar en la punta baja y vender en la alta, ya descontado el impuesto del
-  Grand Exchange. Eso responde directamente *qué comprar* — la app ordena las oportunidades por
-  esa columna. Se valida con un **replay walk-forward** sobre el historial y un **backtest** que
-  simula la estrategia con precios reales, comparado contra reglas triviales de referencia
-  (baseline), contra el screener sin modelo y contra comprar a ciegas. El backtest informa
-  siempre **dos cotas de ejecución** — capturando el spread y cruzándolo — porque la diferencia
-  entre ambas es mucho más grande que cualquier ventaja del modelo, y la verdad está en el medio.
-- **Manda alertas** de las mejores oportunidades del screener por Telegram, con cooldown por
-  ítem para no espamear.
-- **Expone un dashboard** de monitoreo en Streamlit (solo lectura): screener filtrable,
-  calidad del modelo en el tiempo, predicción vs. realidad, pronóstico a futuro y el ranking de
-  qué comprar.
-- **Corre desatendido**: se instala como servicio de usuario de systemd con un comando
-  (`./deploy/instalar_servicio.sh`), se reinicia solo si crashea y avisa por notificación de
-  escritorio si se da por vencido. Un candado de instancia única impide que el servicio y la
-  app recolecten a la vez sobre la misma base.
-- **Tests unitarios** (pytest) de las funciones puras del pipeline (impuesto/margen, ventanas
-  por tiempo, agrupamiento de huecos, checkpoints del replay, umbral del clasificador,
-  accuracy direccional, grilla temporal, features relativas, candado y veredicto de salud).
+En el Grand Exchange cada ítem tiene dos precios: uno bajo, al que la gente vende, y uno alto,
+al que la gente compra. Comprar abajo y vender arriba —un *flip*— deja la diferencia, menos el
+2% de impuesto que cobra el juego al vender. El problema es cuál de los 4.000 ítems conviene y
+en qué momento.
 
-## Qué falta / en desarrollo
+El programa hace cuatro cosas:
 
-- **Aplicación web** para el usuario final — hoy hay una app de escritorio (PySide6/Qt) y el
-  dashboard interno de monitoreo, de solo lectura.
-- **Modelar la probabilidad de que las órdenes se completen.** Toda la ventaja medida del
-  modelo asume que la compra en la punta baja y la venta en la alta se llenan; si hay que cruzar
-  el spread, ninguna estrategia gana. Ya hay una primera medición con datos de 5 minutos (de los
-  ítems que el modelo elige: 78% de las compras se llenan y 52% de los flips se completan dentro
-  de la hora, 65% en dos; de lo que queda colgado, el 78% recupera el precio de venta dentro de
-  6 horas), pero es una muestra chica y todavía no corre sola: falta convertirla en una
-  calibración periódica que la app muestre.
-- El margen predicho anota las alertas de Telegram pero todavía no las filtra: el filtro
-  principal sigue siendo el screener.
+1. **Recolecta** los precios y volúmenes de todos los ítems del juego desde la API pública de la
+   wiki de OSRS, cada 5 minutos, cada hora y cada 6 horas, y los guarda en una base SQLite local.
+   Corre solo, todo el día, y se pone al día si estuvo apagado.
+2. **Calcula el margen** que deja cada ítem ahora mismo, con el impuesto ya descontado, más ROI,
+   volumen, volatilidad y tendencia. Eso es el *screener*: la foto del mercado en este momento.
+3. **Predice** con un modelo de machine learning (XGBoost) el margen que va a dejar cada ítem en
+   la **próxima hora**. Los modelos los crea el usuario, eligiendo qué ítems y cuánto historial;
+   no viene ninguno de fábrica.
+4. **Lo muestra** en una app de escritorio con las oportunidades ordenadas por margen predicho, y
+   manda las mejores por Telegram.
 
-## Estructura del proyecto
+## Por qué predice el margen y no el precio
+
+Parece más natural predecir si el precio va a subir. Se probó, y no funciona: cuando llega el
+primer momento en el que uno puede comprar, la suba ya ocurrió y hay que pagarla. Medido sobre
+720 horas de decisión y 80 ítems, elegir qué comprar con un modelo de precio rendía **−0,38%**
+por operación, peor que elegir al azar (+0,25%).
+
+Predecir el margen ejecutable —lo que deja el flip completo, comprando abajo y vendiendo arriba,
+ya descontado el impuesto— rindió **+4,71%**, contra +2,27% del screener solo. La ventaja no es
+adivinar mejor el futuro: es que baja el listón de ejecución. Con el modelo, las dos órdenes
+tienen que completarse el 60,6% de las veces para no perder plata; comprando a ciegas, el 93,6%.
+
+## Qué tan bien funciona (y qué no se sabe todavía)
+
+Todo lo anterior está validado con *walk-forward*: el modelo se reentrena en los mismos momentos
+en que lo habría hecho en vivo y solo ve los datos que existían hasta ahí, comparado siempre
+contra reglas triviales, contra el screener sin modelo y contra comprar al azar.
+
+Lo que queda abierto es la **ejecución**: que el margen exista no garantiza que las dos órdenes
+se llenen. Con datos de 5 minutos se midió que, de los ítems que el modelo elige, el 78% de las
+compras se completan y el 52% de los flips se cierran dentro de la hora (65% en dos); de lo que
+queda colgado, el 78% recupera el precio de venta dentro de las 6 horas siguientes. La
+esperanza da positiva en todos los casos, pero es una muestra chica y la medición todavía no
+corre sola.
+
+## Estructura
 
 | Archivo | Rol |
 |---|---|
 | `osrs_ge_api.py` | Cliente de la API de precios (OSRS Wiki) |
-| `recolector.py` | Recolección 24/7 + relleno de huecos + jobs programados |
+| `recolector.py` | Recolección 24/7 + relleno de huecos + tareas programadas |
+| `backfill_historico.py` | Relleno manual de un rango histórico, sin reiniciar el recolector |
 | `base_de_datos.py` | Esquema y acceso a la base SQLite |
-| `metricas.py` | Screener de mercado (margen, ROI, volatilidad, etc.) |
-| `preprocesamiento.py` | Feature engineering para los modelos de ML |
-| `entrenador.py` | Entrena los modelos (margen ejecutable, y regresor/clasificador de comparación) |
-| `baseline.py` | Reglas triviales de referencia, para comparar contra el modelo real |
-| `evaluacion.py` | Evaluación del modelo a horizontes de varios pasos |
-| `replay_historico.py` | Reentrenamiento walk-forward sobre un rango del pasado |
-| `backtest.py` | Simulación de la estrategia de flip sobre precios históricos reales |
-| `prediccion.py` | Pronóstico hacia adelante con el modelo ya entrenado |
-| `alertas.py` | Notificaciones de oportunidades por Telegram |
-| `mantenimiento.py` | Retención, downsampling y vacuum de la base de datos |
-| `bloqueo.py` | Candado de instancia única del recolector (un solo proceso por base) |
-| `estado.py` | Estado de salud del pipeline en una pantalla (terminal, barra de estado, scripts) |
+| `metricas.py` | Screener de mercado (margen, ROI, volatilidad) |
+| `preprocesamiento.py` | Feature engineering para los modelos |
+| `entrenador.py` | Entrena los modelos y mide su calidad |
+| `prediccion.py` | Pronóstico hacia adelante con el modelo entrenado |
+| `replay_historico.py` | Reentrenamiento walk-forward sobre el pasado |
+| `backtest.py` | Simulación de la estrategia con precios reales |
+| `baseline.py` | Reglas triviales de referencia, para comparar |
+| `evaluacion.py` | Calidad del modelo a horizontes de varios pasos |
+| `alertas.py` | Avisos de oportunidades por Telegram |
+| `mantenimiento.py` | Retención y compactación de la base |
+| `bloqueo.py` | Candado: un solo recolector por base de datos |
+| `estado.py` | Salud del pipeline en una pantalla |
+| `configuracion.py` | Configuración local (token de Telegram, ruta de la base) |
 | `escritorio/` | App de escritorio (PySide6/Qt) para el usuario final |
-| `deploy/` | Servicio de systemd, lanzador de escritorio e instalador (Linux) |
-| `dashboard.py` | Panel de monitoreo en Streamlit |
-| `backfill_historico.py` | Relleno manual de huecos sin reiniciar el recolector |
-| `tests/` | Tests unitarios de las funciones puras |
-| `testing.ipynb` | Notebook de exploración |
+| `dashboard.py` | Panel de monitoreo en Streamlit, para el desarrollador |
+| `deploy/` | Servicio de systemd, lanzador e instalador (Linux) |
+| `tests/` | 170 tests unitarios (no tocan la API ni la base real) |
 
 ## Cómo empezar
 
 ```bash
 pip install -r requirements.txt
-python recolector.py              # recolector 24/7 (recolección + reentrenamiento + alertas)
-python -m escritorio.main         # app de escritorio
-python estado.py                  # ¿está sano el pipeline?
-streamlit run dashboard.py        # dashboard de monitoreo, solo lectura
-python -m pytest tests/           # tests unitarios
+python recolector.py          # empieza a recolectar
+python -m escritorio.main     # la app: oportunidades y modelos
+python estado.py              # ¿está todo al día?
 ```
 
-Para dejarlo corriendo permanentemente en Linux (arranca con la PC, se reinicia solo):
+Para dejarlo corriendo permanentemente en Linux (arranca con la PC y se reinicia solo):
 
 ```bash
 ./deploy/instalar_servicio.sh
-loginctl enable-linger $USER      # este paso pide autenticación, por eso va aparte
+loginctl enable-linger $USER   # este paso pide autenticación, por eso va aparte
 ```
 
-Ver `CLAUDE.md` para el detalle de arquitectura, cada módulo y sus decisiones de diseño, y
-`docs/despliegue_24_7.md` para dejarlo corriendo como servicio (incluye cómo configurar las
-alertas de Telegram).
+El detalle de arquitectura y las decisiones de diseño están en `CLAUDE.md`; el despliegue 24/7 y
+las alertas de Telegram, en `docs/despliegue_24_7.md`.
 
 ## Fuente de datos
 
-Los precios se obtienen de la [API pública de la OSRS Wiki](https://prices.runescape.wiki/api/v1/osrs),
+Los precios salen de la [API pública de la OSRS Wiki](https://prices.runescape.wiki/api/v1/osrs),
 que separa compra y venta instantánea por intervalo — justo lo que necesita este proyecto. Se
-contrastó puntualmente contra el endpoint oficial de Jagex como control de veracidad (desviación
-menor a 1%), pero esa fuente no se usa para recolectar: es más coarse (solo promedio diario) y no
-está pensada para acceso programático sostenido.
+contrastó puntualmente contra el endpoint oficial de Jagex como control (desviación menor al 1%),
+pero esa fuente no se usa: es más gruesa (solo promedio diario) y no está pensada para acceso
+programático sostenido.
