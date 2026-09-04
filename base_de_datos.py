@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import pandas as pd
 import time
@@ -25,6 +26,13 @@ class OSRSBaseDatos:
     def __init__(self, db_path = DB_PATH ):
         
         self.db_path = db_path
+
+        # sqlite3.connect no crea directorios padre — en un clon nuevo del
+        # repo (a diferencia de una instalación vieja donde 'data/' ya
+        # existía de antes) esto fallaba con "unable to open database file".
+        carpeta = os.path.dirname(self.db_path)
+        if carpeta:
+            os.makedirs(carpeta, exist_ok=True)
 
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
