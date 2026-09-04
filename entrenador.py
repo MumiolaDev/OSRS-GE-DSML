@@ -94,41 +94,49 @@ _DIRECCION_POR_CLASE = {0: -1, 1: 0, 2: 1}
 
 def accuracy_direccional(target_real, direccion_predicha, umbral_pct=UMBRAL_CLASIF_PCT):
     """
-    Fracción de aciertos de DIRECCIÓN sobre los períodos en que el precio
-    efectivamente se movió (|log-retorno real| > umbral_pct%).
+    Fracción de aciertos de DIRECCIÓN sobre los períodos en que (a) el precio
+    efectivamente se movió (|log-retorno real| > umbral_pct%) y (b) el modelo
+    se jugó por una dirección. Devuelve (accuracy, n_evaluado), donde
+    n_evaluado es el tamaño de esa población; accuracy es None si está vacía.
 
     Definición única y compartida entre el regresor y el clasificador — sin
     esto las dos métricas se guardaban en la misma columna de model_metrics
-    calculadas sobre poblaciones distintas, y no eran comparables:
+    calculadas sobre poblaciones distintas, y no eran comparables. El
+    regresor usaba `sign(pred) == sign(real)` sobre TODAS las filas: en los
+    períodos sin movimiento el retorno real es exactamente 0 (entre el 7% y
+    el 35% de las horas según el ítem, medido sobre datos reales — los
+    precios que devuelve la API son enteros y muchos ítems no se mueven en
+    una hora), su signo es 0, y el modelo nunca predice exactamente 0, así
+    que TODOS esos empates contaban como error. Medido: la misma corrida
+    daba 31.7% con esa fórmula y 55.9% con esta.
 
-    - El regresor usaba `sign(pred) == sign(real)` sobre TODAS las filas. En
-      los períodos sin movimiento el retorno real es exactamente 0 (entre el
-      7% y el 35% de las horas según el ítem, medido sobre datos reales:
-      los precios son enteros y muchos ítems no se mueven en una hora), su
-      signo es 0, y el modelo nunca predice exactamente 0 — así que TODOS
-      esos empates contaban como error. Medido: la misma corrida daba 31.7%
-      con esa fórmula y 55.9% con esta.
-    - El clasificador excluía los casos 'estable' tanto reales como
-      predichos, lo que además de cambiar la población le regalaba los casos
-      en que se abstenía.
+    Las dos condiciones son necesarias y ninguna se puede relajar:
+    - Sin (a), los empates hunden artificialmente al regresor.
+    - Sin (b), el clasificador queda castigado por abstenerse ('estable'):
+      abstenerse no es equivocarse, es no jugar. Un clasificador que se juega
+      en el 3% de los casos daba 29% acá, que se lee como "se equivoca casi
+      siempre" cuando en realidad la lectura correcta es "casi nunca opina".
+      Lo que evita que abstenerse sea un truco para inflar el número es
+      `n_evaluado`: un modelo que se juega diez veces tiene un intervalo de
+      confianza enorme, y quien muestre la métrica tiene que usarlo (ver
+      escritorio/paginas/pagina_modelos._margen_error_95).
 
-    Acá los períodos sin movimiento real quedan fuera de la cuenta (no hay
-    dirección que acertar), pero abstenerse cuando SÍ hubo movimiento cuenta
-    como error: el modelo tuvo la oportunidad y no la vio.
+    Para el regresor (b) no cambia nada: una predicción continua nunca es
+    exactamente 0, así que siempre se juega y n_evaluado son todos los
+    movimientos reales.
 
     `direccion_predicha` puede ser un retorno continuo (regresor, se usa su
-    signo) o ya un -1/0/+1. Devuelve (accuracy, n_evaluado); accuracy es
-    None si no hubo ningún movimiento por encima del umbral.
+    signo) o ya un -1/0/+1 (clasificador, ver _direcciones_desde_clases).
     """
     target_real = np.asarray(target_real, dtype=float)
     direccion_predicha = np.asarray(direccion_predicha, dtype=float)
     umbral = umbral_pct / 100
 
-    hubo_movimiento = np.abs(target_real) > umbral
-    n = int(hubo_movimiento.sum())
+    evaluables = (np.abs(target_real) > umbral) & (np.sign(direccion_predicha) != 0)
+    n = int(evaluables.sum())
     if n == 0:
         return None, 0
-    aciertos = np.sign(direccion_predicha[hubo_movimiento]) == np.sign(target_real[hubo_movimiento])
+    aciertos = np.sign(direccion_predicha[evaluables]) == np.sign(target_real[evaluables])
     return float(aciertos.mean()), n
 
 

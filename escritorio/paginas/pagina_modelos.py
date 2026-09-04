@@ -133,7 +133,7 @@ def _resumen_calidad(db, model_id):
 
     if acc is not None:
         conn.close()
-        etiqueta = f" — walk-forward, {n_corridas} checkpoints, {n_evaluado or 0} movimientos"
+        etiqueta = f" — walk-forward, {n_corridas} checkpoints, {n_evaluado or 0} movimientos jugados"
     else:
         c.execute(
             '''SELECT accuracy_direccional, COALESCE(n_evaluado, 0) FROM model_metrics
@@ -147,7 +147,7 @@ def _resumen_calidad(db, model_id):
         if fila is None:
             return "Sin entrenar todavía"
         acc, n_evaluado = fila
-        etiqueta = "" if acc is None else f" — holdout, {n_evaluado} movimientos"
+        etiqueta = "" if acc is None else f" — holdout, {n_evaluado} movimientos jugados"
 
     if acc is None:
         return "Entrenado (sin métrica de dirección)"
@@ -155,6 +155,11 @@ def _resumen_calidad(db, model_id):
     margen = _margen_error_95(acc, n_evaluado)
     if margen is None:
         return f"Acierta la dirección {acc:.0%} de las veces{etiqueta}"
+    if acc + margen < 0.5:
+        # Estado propio, no "indistinguible": el modelo se equivoca de forma
+        # consistente y eso es información (una señal invertida acertaría),
+        # muy distinto de no poder afirmar nada.
+        return f"Peor que el azar ({acc:.0%} ±{margen:.0%}){etiqueta}"
     if acc - margen <= 0.5:
         return f"Indistinguible del azar ({acc:.0%} ±{margen:.0%}){etiqueta}"
     if acc - margen >= 0.55:

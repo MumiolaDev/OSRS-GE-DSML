@@ -8,6 +8,7 @@ el docstring de la función). _ultimo_bucket_cerrado es lo que corrige que la
 recolección en vivo fuera dos períodos más vieja de lo necesario.
 """
 import numpy as np
+import pytest
 
 from entrenador import UMBRAL_CLASIF_PCT, UMBRAL_COSTO_PCT, _direcciones_desde_clases, accuracy_direccional
 from recolector import _ultimo_bucket_cerrado
@@ -54,18 +55,36 @@ class TestAccuracyDireccional:
         assert n == 4
         assert acc == 0.5
 
-    def test_clasificador_y_regresor_usan_la_misma_poblacion(self):
-        """La clave de la comparabilidad: el clasificador excluía además los
-        casos en los que él mismo predecía 'estable', o sea que abstenerse le
-        salía gratis. Ahora abstenerse cuando hubo movimiento cuenta como
-        error, igual que para el regresor."""
+    def test_abstenerse_no_cuenta_como_error_pero_achica_la_muestra(self):
+        """Abstenerse ('estable') no es equivocarse, es no jugar: esas filas
+        salen del denominador. Lo que evita que abstenerse sea un truco para
+        inflar el numero es n_evaluado, que se desploma y hace explotar el
+        intervalo de confianza de quien muestre la metrica."""
         real = np.array([0.02, 0.02, -0.02, -0.02])
         clases = np.array([2, 1, 0, 1])  # acierta 2, se abstiene en 2
 
         acc, n = accuracy_direccional(real, _direcciones_desde_clases(clases))
 
-        assert n == 4
-        assert acc == 0.5
+        assert n == 2  # solo los movimientos en los que se jugo
+        assert acc == 1.0
+
+    def test_el_regresor_siempre_se_juega(self):
+        """Para una prediccion continua, sign(pred) nunca es 0, asi que la
+        condicion de 'se jugo' no le cambia nada: n_evaluado son todos los
+        movimientos reales."""
+        real = np.array([0.02, -0.02, 0.02])
+        pred = np.array([0.001, -0.001, -0.001])
+
+        acc, n = accuracy_direccional(real, pred)
+
+        assert n == 3
+        assert acc == pytest.approx(2 / 3)
+
+    def test_un_clasificador_que_siempre_se_abstiene_no_tiene_metrica(self):
+        real = np.array([0.02, -0.02])
+        acc, n = accuracy_direccional(real, _direcciones_desde_clases([1, 1]))
+        assert n == 0
+        assert acc is None
 
     def test_direcciones_desde_clases(self):
         assert list(_direcciones_desde_clases([0, 1, 2])) == [-1.0, 0.0, 1.0]

@@ -138,8 +138,16 @@ class TestResumenCalidad:
         self._insertar_metrica(db, 'modelo_x', 0.50)
         assert "Indistinguible del azar" in _resumen_calidad(db, 'modelo_x')
 
-    def test_peor_que_el_azar_tambien_es_indistinguible_o_peor(self, db):
+    def test_peor_que_el_azar_es_un_estado_propio(self, db):
+        """29% ±3% no es "no se puede afirmar nada": el modelo se equivoca de
+        forma consistente, que es información (invertir la señal acertaría).
+        Confundir los dos casos fue justo lo que apareció al validar contra
+        datos reales."""
         self._insertar_metrica(db, 'modelo_x', 0.40)
+        assert "Peor que el azar" in _resumen_calidad(db, 'modelo_x')
+
+    def test_peor_que_el_azar_con_muestra_chica_sigue_siendo_indistinguible(self, db):
+        self._insertar_metrica(db, 'modelo_x', 0.40, n_evaluado=20)
         assert "Indistinguible del azar" in _resumen_calidad(db, 'modelo_x')
 
     def test_accuracy_alta_con_muestra_chica_no_se_declara_buena(self, db):

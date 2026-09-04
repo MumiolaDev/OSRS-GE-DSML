@@ -183,15 +183,19 @@ modelos_config (alta/pausa/borrado de modelos, botón "Entrenar ahora"), además
   (ver el bullet de `base_de_datos.py` y de `escritorio/`), `MODEL_NAME_HORARIO`/
   `MODEL_NAME_DIARIO`/`MODEL_NAME_CLASIF_F2P_100GP`/etc. son solo nombres de referencia que la
   app/el dashboard usan como default si un modelo con ese nombre exacto llega a existir.
-  **Métricas (`accuracy_direccional`, una sola definición compartida)**: la accuracy
-  direccional se mide SOLO sobre los períodos en que el precio efectivamente se movió más que
-  `UMBRAL_CLASIF_PCT`. Antes el regresor usaba `sign(pred)==sign(real)` sobre todas las filas,
-  y como el retorno real es exactamente 0 entre el 7% y el 35% de las horas según el ítem (los
-  precios son enteros), todos esos empates contaban como error: la misma corrida daba 31.7%
-  con esa fórmula y 55.9% con la actual. El clasificador, en cambio, excluía los casos
-  'estable' reales Y predichos, o sea que abstenerse le salía gratis — dos poblaciones
-  distintas en la misma columna de `model_metrics`. Parte de la ventaja del clasificador sobre
-  el regresor que este archivo documentaba venía de esa diferencia de definición.
+  **Métricas (`accuracy_direccional`, una sola definición compartida)**: se mide sobre los
+  períodos en que (a) el precio se movió más que `UMBRAL_CLASIF_PCT` y (b) el modelo se jugó
+  por una dirección. Las dos condiciones hacen falta: sin (a), los empates hunden al regresor
+  (el retorno real es exactamente 0 entre el 7% y el 35% de las horas según el ítem porque los
+  precios de la API son enteros, y el regresor nunca predice 0 — la misma corrida daba 31.7%
+  contando los empates y 55.9% sin contarlos); sin (b), el clasificador queda castigado por
+  abstenerse, que no es equivocarse (uno que se juega en el 3% de los casos marcaba 29%, que
+  se lee como "se equivoca casi siempre" en vez de "casi nunca opina"). Lo que evita que
+  abstenerse sea un truco para inflar el número es `n_evaluado` — la app lo usa para el
+  intervalo de confianza, y un modelo que se juega diez veces queda "indistinguible del azar"
+  por ancho de intervalo, no por su número puntual. Antes cada modelo usaba su propia
+  definición sobre poblaciones distintas y las dos se guardaban en la misma columna: parte de
+  la ventaja del clasificador sobre el regresor que este archivo documentaba venía de ahí.
   `model_metrics.mae`/`rmse` son ahora SIEMPRE gp (antes la fila agregada iba en log-retorno y
   las de detalle por ítem en gp, en la misma columna); el espacio log vive en
   `mae_retorno`/`rmse_retorno`, y `n_evaluado` dice sobre cuántos movimientos se midió la
