@@ -69,8 +69,8 @@ política de retención, con catch-up si la ventana se perdió.
 un entorno gráfico con soporte de Qt (probado en Wayland y X11).
 
 ```bash
-git clone https://github.com/MumiolaDev/OSRS-GE-mobile.git
-cd OSRS-GE-mobile
+git clone https://github.com/MumiolaDev/OSRS-GE-DSML.git
+cd OSRS-GE-DSML
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
